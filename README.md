@@ -16,6 +16,7 @@ make release    # dead-stripped, symbols removed (~243 kb)
 make install    # → $(PREFIX)/bin, default /usr/local
 make uninstall
 make test       # unit tests under asan/ubsan
+make uitest     # terminal render + scroll checks (needs python + pyte)
 make STATIC=1   # static binary (best with musl-gcc)
 make DEBUG=1    # asan/ubsan
 ```
@@ -199,8 +200,19 @@ arrays it reallocs. raw mode + diffed grid + key decoding is ~450 lines.
 
 `make test` builds `tests/` under asan and ubsan with a deliberately tiny
 transcript arena, so compaction and eviction are exercised in a short run
-rather than only after hours of use. ci also compiles with `-Werror` on
-gcc and clang across linux and macos, and checks the static link.
+rather than only after hours of use.
+
+`make uitest` covers the two display bugs that have actually shipped. it
+replays term.c's own escape output through an independent terminal emulator
+and checks the result matches term.c's back buffer — drift there is what
+leaves stale glyphs, usually via wide characters. it then fires bursts of
+scroll events faster than the repaint coalescing window and checks the
+settled screen equals a forced full repaint, which catches a deferred frame
+being stranded. `LAMBDA_SELFTEST_FILL=n` seeds the transcript so this runs
+with no api key.
+
+ci compiles with `-Werror` on gcc and clang across linux and macos, runs both
+suites, and checks the static link.
 
 ## limits
 

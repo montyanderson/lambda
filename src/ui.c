@@ -890,23 +890,23 @@ static int handle_view_event(term_event ev)
     int th = view_rows();
     switch (ev.type) {
     case K_RESIZE:
-        ui_render();
+        ui_render_force();
         return 1;
     case K_WHEEL_UP:
         scroll_by(-3);
-        ui_render();
+        ui_render_force();
         return 1;
     case K_WHEEL_DOWN:
         scroll_by(3);
-        ui_render();
+        ui_render_force();
         return 1;
     case K_PGUP:
         scroll_by(-(th - 1));
-        ui_render();
+        ui_render_force();
         return 1;
     case K_PGDN:
         scroll_by(th - 1);
-        ui_render();
+        ui_render_force();
         return 1;
     default:
         return 0;
@@ -1142,9 +1142,15 @@ int ui_readline(const char *prompt, char *out, size_t cap)
 
     int rc = 0;
     for (;;) {
-        term_event ev = term_poll(-1);
-        if (ev.type == K_NONE)
+        /* A coalesced repaint may still be pending. Blocking indefinitely
+         * with one outstanding would leave a stale frame on screen until the
+         * next keystroke, which looks like the display is stuck mid-scroll. */
+        term_event ev = term_poll(g_dirty ? RENDER_MIN_MS : -1);
+        if (ev.type == K_NONE) {
+            if (g_dirty)
+                ui_render_force();
             continue;
+        }
         if (ev.type == K_EOF) {
             rc = 0;
             break;

@@ -311,6 +311,23 @@ int main(int argc, char **argv)
     }
 
     refresh_badge(c);
+
+    /* Test hook: seed the transcript so the scroll/repaint tests can run
+     * without an api key. Env-only, so it stays off the cli surface. */
+    {
+        const char *fill = getenv("LAMBDA_SELFTEST_FILL");
+        if (fill && *fill) {
+            long n = strtol(fill, NULL, 10);
+            char line[160];
+            for (long i = 0; i < n; i++) {
+                snprintf(line, sizeof line,
+                         "selftest %ld — the quick brown fox jumps over the "
+                         "lazy dog %ld", i, i);
+                ui_add(i % 3 == 0 ? UI_TOOL_OUT : UI_ASSISTANT, line);
+            }
+        }
+    }
+
     ui_add(UI_NOTICE,
            "λ lambda — type a message, /help for commands, ctrl-d to quit");
 

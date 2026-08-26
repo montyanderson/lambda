@@ -5,6 +5,7 @@
 #   make install      install to $(PREFIX)/bin  (default /usr/local)
 #   make uninstall    remove it again
 #   make test         build and run the unit tests (asan/ubsan)
+#   make uitest       terminal render + scroll checks (needs python + pyte)
 #   make STATIC=1     fully static binary (linux; best with musl)
 #   make DEBUG=1      -O0 -g with sanitizers
 #   make clean
@@ -88,7 +89,7 @@ uninstall:
 # Tests include the translation unit under test so they can reach its static
 # state, so they compile their own dependencies rather than linking build/.
 # The arena is shrunk right down so compaction is exercised in a short run.
-TEST_SRC   := $(wildcard tests/*.c)
+TEST_SRC   := $(filter-out tests/term_harness.c,$(wildcard tests/*.c))
 TEST_BIN   := $(patsubst tests/%.c,build/tests/%,$(TEST_SRC))
 TEST_CFLAGS := -std=c99 -Wall -Wextra -O1 -g -fsanitize=address,undefined
 TEST_DEFS   := -DLAMBDA_TRANSCRIPT_ARENA=4096 -DLAMBDA_MAX_ITEMS=8
@@ -102,7 +103,19 @@ test: $(TEST_BIN)
 	@for t in $(TEST_BIN); do echo "== $$t"; $$t || exit 1; done
 	@echo "all tests passed"
 
+# The ui checks replay term.c's own output through an independent terminal
+# emulator, so they need python with pyte. Kept separate from `test` so the
+# c-only suite stays dependency-free.
+PYTHON ?= python3
+
+build/tests/term_harness: tests/term_harness.c src/term.c src/term.h
+	@mkdir -p $(dir $@)
+	$(CC) -std=c99 -O1 -g -w $(CPPFLAGS) -o $@ $<
+
+uitest: build/tests/term_harness lambda
+	$(PYTHON) tests/ui_check.py
+
 clean:
 	rm -rf build lambda
 
-.PHONY: clean release install uninstall test
+.PHONY: clean release install uninstall test uitest

@@ -48,13 +48,63 @@ static void on_winch(int sig)
 }
 
 /* ---- output buffering --------------------------------------------------- */
+
+/* Write everything, or record that we could not.
+ *
+ * Never discards: term_present has already recorded these cells in the front
+ * buffer, so dropping bytes here desynchronises the buffer from the screen
+ * permanently and leaves stale glyphs that no later diff will repaint. */
+static void flush_out(void)
+{
+    size_t off = 0;
+    while (off < g_outlen) {
+        ssize_t n = write(STDOUT_FILENO, g_out + off, g_outlen - off);
+        if (n < 0) {
+            if (errno == EINTR)
+                continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                /* a non-blocking tty with a full kernel buffer — common on a
+                 * saturated ssh link. wait for room rather than drop. */
+                fd_set wf;
+                FD_ZERO(&wf);
+                FD_SET(STDOUT_FILENO, &wf);
+                if (select(STDOUT_FILENO + 1, NULL, &wf, NULL, NULL) < 0 &&
+                    errno != EINTR) {
+                    g_dropped = 1;
+                    break;
+                }
+                continue;
+            }
+            g_dropped = 1; /* unrecoverable; resync on the next present */
+            break;
+        }
+        off += (size_t)n;
+    }
+    g_outlen = 0;
+}
+
+/* Buffer output, flushing early when full.
+ *
+ * A full repaint of a large terminal can emit more than the buffer holds, so
+ * overflow must not mean "drop" — that used to force a resync, which emitted
+ * an even larger repaint, which dropped again. Flushing mid-present is safe:
+ * the escape sequences are self-contained and strictly ordered. */
 static void out(const char *s, size_t n)
 {
-    if (g_outlen + n > sizeof g_out) {
-        /* Dropping bytes desynchronises the front buffer from the screen,
-         * because present() has already recorded these cells as written.
-         * Flag it so the next present repaints everything from scratch. */
-        g_dropped = 1;
+    if (g_outlen + n > sizeof g_out)
+        flush_out();
+    if (n > sizeof g_out) { /* single chunk larger than the whole buffer */
+        size_t off = 0;
+        while (off < n) {
+            ssize_t w = write(STDOUT_FILENO, s + off, n - off);
+            if (w < 0) {
+                if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)
+                    continue;
+                g_dropped = 1;
+                return;
+            }
+            off += (size_t)w;
+        }
         return;
     }
     memcpy(g_out + g_outlen, s, n);
@@ -72,21 +122,6 @@ static void outf(const char *fmt, ...)
     va_end(ap);
     if (n > 0)
         out(tmp, (size_t)n < sizeof tmp ? (size_t)n : sizeof tmp - 1);
-}
-
-static void flush_out(void)
-{
-    size_t off = 0;
-    while (off < g_outlen) {
-        ssize_t n = write(STDOUT_FILENO, g_out + off, g_outlen - off);
-        if (n < 0) {
-            if (errno == EINTR)
-                continue;
-            break;
-        }
-        off += (size_t)n;
-    }
-    g_outlen = 0;
 }
 
 /* ---- size --------------------------------------------------------------- */
