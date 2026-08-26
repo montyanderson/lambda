@@ -15,6 +15,7 @@ make            # → ./lambda
 make release    # dead-stripped, symbols removed (~243 kb)
 make install    # → $(PREFIX)/bin, default /usr/local
 make uninstall
+make test       # unit tests under asan/ubsan
 make STATIC=1   # static binary (best with musl-gcc)
 make DEBUG=1    # asan/ubsan
 ```
@@ -193,6 +194,13 @@ terminal disagree and stale glyphs linger when scrolling.
 
 no termbox/curses: lambda uses ~5% of either, and termbox2 keeps pointers into
 arrays it reallocs. raw mode + diffed grid + key decoding is ~450 lines.
+
+## tests
+
+`make test` builds `tests/` under asan and ubsan with a deliberately tiny
+transcript arena, so compaction and eviction are exercised in a short run
+rather than only after hours of use. ci also compiles with `-Werror` on
+gcc and clang across linux and macos, and checks the static link.
 
 ## limits
 

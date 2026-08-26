@@ -90,26 +90,43 @@ int ui_is_tty(void)
 }
 
 /* drop oldest items until `need` bytes are free at the arena tail */
-static void arena_make_room(size_t need)
+/* Drop the oldest `n` items and reclaim their bytes. Items are stored
+ * contiguously from offset 0, so dropping a prefix frees exactly
+ * g_items[n].off bytes. */
+static void drop_oldest(int n)
 {
-    if (need > sizeof g_arena)
-        need = sizeof g_arena;
-    int drop = 0;
-    while (sizeof g_arena - g_used < need && drop < g_nitems)
-        drop++;
-    if (drop == 0)
+    if (n <= 0)
         return;
-    size_t freed = (drop < g_nitems) ? g_items[drop].off : g_used;
+    if (n > g_nitems)
+        n = g_nitems;
+    size_t freed = (n < g_nitems) ? g_items[n].off : g_used;
     memmove(g_arena, g_arena + freed, g_used - freed);
     g_used -= freed;
-    for (int i = drop; i < g_nitems; i++) {
-        g_items[i - drop] = g_items[i];
-        g_items[i - drop].off -= freed;
+    for (int i = n; i < g_nitems; i++) {
+        g_items[i - n] = g_items[i];
+        g_items[i - n].off -= freed;
     }
-    g_nitems -= drop;
+    g_nitems -= n;
+    g_gen++;
 }
 
-static void arena_append(const char *s, size_t len)
+/* Free at least `need` bytes by discarding the oldest items. The newest item
+ * is never dropped: it may be an open stream currently being appended to. */
+static void arena_make_room(size_t need)
+{
+    size_t avail = sizeof g_arena - g_used;
+    if (avail >= need)
+        return;
+    size_t deficit = need - avail;
+    int drop = 0;
+    while (drop < g_nitems - 1 && g_items[drop].off < deficit)
+        drop++;
+    drop_oldest(drop);
+}
+
+/* returns the number of bytes actually stored, which is less than `len` if
+ * the arena could not be made to fit them */
+static size_t arena_append(const char *s, size_t len)
 {
     if (len > sizeof g_arena)
         len = sizeof g_arena;
@@ -119,6 +136,7 @@ static void arena_append(const char *s, size_t len)
         len = sizeof g_arena - g_used;
     memcpy(g_arena + g_used, s, len);
     g_used += len;
+    return len;
 }
 
 /* ---- headless (non-tty) backend --------------------------------------- */
@@ -179,14 +197,8 @@ void ui_set_model(const char *model)
 /* ---- items ------------------------------------------------------------- */
 static void item_open(int kind)
 {
-    if (g_nitems == LAMBDA_MAX_ITEMS) {
-        /* drop oldest item wholesale */
-        arena_make_room(sizeof g_arena); /* forces a big compaction */
-    }
-    if (g_nitems == LAMBDA_MAX_ITEMS) {
-        memmove(g_items, g_items + 1, sizeof(item) * (LAMBDA_MAX_ITEMS - 1));
-        g_nitems--;
-    }
+    if (g_nitems == LAMBDA_MAX_ITEMS)
+        drop_oldest(1);
     g_items[g_nitems].kind = kind;
     g_items[g_nitems].off = g_used;
     g_items[g_nitems].len = 0;
@@ -196,10 +208,12 @@ static void item_open(int kind)
 
 static void item_extend(const char *s, size_t len)
 {
-    size_t before = g_used;
-    arena_append(s, len);
-    /* arena_make_room may have shifted offsets; last item is current */
-    g_items[g_nitems - 1].len += g_used - before;
+    if (g_nitems == 0)
+        return;
+    /* Use the count arena_append reports. Comparing g_used before and after
+     * is wrong: a compaction moves g_used backwards, and the difference
+     * underflows into a huge length. */
+    g_items[g_nitems - 1].len += arena_append(s, len);
     g_gen++;
 }
 

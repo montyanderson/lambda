@@ -4,6 +4,7 @@
 #   make release      optimized, dead-stripped, symbols removed
 #   make install      install to $(PREFIX)/bin  (default /usr/local)
 #   make uninstall    remove it again
+#   make test         build and run the unit tests (asan/ubsan)
 #   make STATIC=1     fully static binary (linux; best with musl)
 #   make DEBUG=1      -O0 -g with sanitizers
 #   make clean
@@ -34,6 +35,9 @@ ifeq ($(RELEASE),1)
 CFLAGS  := -std=c99 -Wall -Wextra -O2 -DNDEBUG \
            -ffunction-sections -fdata-sections
 LDFLAGS += $(GC_LDFLAGS)
+endif
+ifeq ($(WERROR),1)
+CFLAGS += -Werror
 endif
 ifeq ($(STATIC),1)
 LDFLAGS += -static
@@ -81,7 +85,24 @@ uninstall:
 	rm -f $(DESTDIR)$(BINDIR)/lambda
 	@echo "removed $(DESTDIR)$(BINDIR)/lambda"
 
+# Tests include the translation unit under test so they can reach its static
+# state, so they compile their own dependencies rather than linking build/.
+# The arena is shrunk right down so compaction is exercised in a short run.
+TEST_SRC   := $(wildcard tests/*.c)
+TEST_BIN   := $(patsubst tests/%.c,build/tests/%,$(TEST_SRC))
+TEST_CFLAGS := -std=c99 -Wall -Wextra -O1 -g -fsanitize=address,undefined
+TEST_DEFS   := -DLAMBDA_TRANSCRIPT_ARENA=4096 -DLAMBDA_MAX_ITEMS=8
+
+build/tests/%: tests/%.c $(wildcard src/*.c) $(wildcard src/*.h)
+	@mkdir -p $(dir $@)
+	$(CC) $(TEST_CFLAGS) $(CPPFLAGS) $(TEST_DEFS) -o $@ $< \
+	    src/term.c src/md.c src/util.c
+
+test: $(TEST_BIN)
+	@for t in $(TEST_BIN); do echo "== $$t"; $$t || exit 1; done
+	@echo "all tests passed"
+
 clean:
 	rm -rf build lambda
 
-.PHONY: clean release install uninstall
+.PHONY: clean release install uninstall test

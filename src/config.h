@@ -32,8 +32,12 @@
 #define LAMBDA_CONTEXT_FILES 16         /* how many such files to load */
 #define LAMBDA_SESSION_QUEUE (1u << 20) /* buffered session-log bytes */
 
+#ifndef LAMBDA_TRANSCRIPT_ARENA
 #define LAMBDA_TRANSCRIPT_ARENA (4u << 20) /* on-screen transcript text */
+#endif
+#ifndef LAMBDA_MAX_ITEMS
 #define LAMBDA_MAX_ITEMS 4096              /* transcript items */
+#endif
 #define LAMBDA_WRAP_LINES 65536            /* wrapped visual lines index */
 
 #define LAMBDA_PLUGINS_MAX 32          /* registered plugin tools */

@@ -1,0 +1,60 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: build ${{ matrix.os }} / ${{ matrix.cc }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        cc: [gcc, clang]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: compile (warnings are errors)
+        run: make WERROR=1 CC=${{ matrix.cc }}
+
+      - name: it runs
+        run: ./lambda --version
+
+      - name: no credentials is a clean error, not a crash
+        run: |
+          set +e
+          out=$(./lambda -p hi 2>&1); rc=$?
+          echo "$out"
+          test $rc -eq 1 || { echo "expected exit 1, got $rc"; exit 1; }
+          echo "$out" | grep -q "no credentials" || { echo "expected a credentials error"; exit 1; }
+
+      - name: release build
+        run: make clean && make release CC=${{ matrix.cc }}
+
+      - name: release binary runs
+        run: ./lambda --version
+
+  test:
+    name: tests (asan + ubsan)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: unit tests
+        run: make test
+
+  static:
+    name: static link (glibc)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: build
+        run: make STATIC=1
+      - name: confirm it is static and runs
+        run: |
+          file lambda
+          ldd lambda || true   # "not a dynamic executable" is the pass case
+          ./lambda --version
