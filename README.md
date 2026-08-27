@@ -1,28 +1,14 @@
-<div align="center">
-
 # λ lambda
 
-**a minimal, portable agent harness in c**
+extremely fast portable agent harness in c.
 
-[![ci](https://github.com/montyanderson/lambda/actions/workflows/ci.yml/badge.svg)](https://github.com/montyanderson/lambda/actions/workflows/ci.yml)
+<img src="screenshot.png" alt="lambda tui" width="792">
 
-zero heap allocations · ~243 kb static binary · ~1 ms startup
-
-<img src="screenshot.png" alt="lambda tui screenshot" width="792">
-
-</div>
-
----
-
-## highlights
-
-* **fast** — starts in ~1 ms; you're typing before your shell prompt would have redrawn
-* **small** — a single dead-stripped binary around 243 kb, statically linkable
-* **allocation-free** — every buffer is a static arena; zero mallocs attributed to lambda in a full session
-* **portable** — c99 + gnu make, runs on posix linux & macos, deps vendored in-repo
-* **pretty** — fixed-frame claude-code-style tui with live streaming, markdown, and internal scrollback
-* **hackable** — single-file c plugins (exa web search included)
-* **durable** — every chat saved as resumable ndjson that survives `kill -9`
+* fixed-frame tui, scrolls internally, basic markdown
+* portable and statically linked
+* minimal dynamic memory allocation
+* single-file c plugins (exa web search included)
+* every chat saved as resumable ndjson
 
 ## build
 
@@ -66,10 +52,10 @@ lambda resume FILE          # continue a specific one
 | `--no-context` | ignore `AGENTS.md` / `CLAUDE.md` |
 | `--no-fallback` | disable refusal fallbacks |
 
-**commands** — `/model`, `/system`, `/effort`, `/thinking`, `/tools`, `/clear`,
+commands: `/model`, `/system`, `/effort`, `/thinking`, `/tools`, `/clear`,
 `/help`, `/quit`.
 
-**keys** — enter sends. pgup/pgdn or wheel scroll. ctrl-c interrupts a reply or a
+keys: enter sends. pgup/pgdn or wheel scroll. ctrl-c interrupts a reply or a
 running command. ctrl-d quits. ctrl-a/e/k/u/w edit, up/down for history.
 
 the input stays live while the model works — enter queues instead of
@@ -127,9 +113,8 @@ runs `/bin/sh -c` in its own process group from the cwd. stdout+stderr merged,
 truncated at 64 kb, non-zero exit reported to the model. no state persists
 between calls. ctrl-c signals the whole group.
 
-> [!WARNING]
-> **no approval prompt** — if claude decides to run something, it runs. don't
-> point it at a directory you'd mind it changing. `--no-tools` disables.
+**no approval prompt** — if claude decides to run something, it runs. don't
+point it at a directory you'd mind it changing. `--no-tools` disables.
 
 ## plugins
 
