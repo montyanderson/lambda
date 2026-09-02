@@ -6,6 +6,7 @@
 #include "ui.h"
 #include "config.h"
 #include "md.h"
+#include "table.h"
 #include "http.h"
 #include "util.h"
 
@@ -322,6 +323,7 @@ typedef struct {
     int kind;
     const char *p;
     int len;
+    const unsigned char *flags; /* pre-styled line (a table row), or NULL */
     unsigned char first; /* first visual line of its item (draw gutter) */
     unsigned char sol;   /* starts a source line (leading md markers apply) */
     unsigned char fence; /* inside a ``` block */
@@ -351,6 +353,7 @@ static void push_vl(int kind, const char *p, int len)
     g_vl[g_nvl].kind = kind;
     g_vl[g_nvl].p = p;
     g_vl[g_nvl].len = len;
+    g_vl[g_nvl].flags = NULL;
     g_vl[g_nvl].first = (unsigned char)g_first_pending;
     g_vl[g_nvl].sol = (unsigned char)g_sol_pending;
     g_vl[g_nvl].fence = (unsigned char)g_fence_cur;
@@ -395,6 +398,54 @@ static int wants_gap(int prev_kind, int kind)
     return 1;
 }
 
+/* Markdown tables are laid out as a block, not a line at a time, so their
+ * formatted rows live in their own arena with a parallel style array. It is
+ * rebuilt from scratch alongside the wrap index, so it only has to hold the
+ * tables currently on the transcript. */
+static char g_tbl[LAMBDA_TABLE_ARENA];
+static unsigned char g_tblf[LAMBDA_TABLE_ARENA];
+static size_t g_tbl_used;
+static int g_tbl_fail; /* the table did not fit: roll it back */
+
+static void tbl_emit(void *ud, const char *text, const unsigned char *flags,
+                     int len)
+{
+    if (len < 0 || g_tbl_used + (size_t)len > sizeof g_tbl) {
+        g_tbl_fail = 1;
+        return;
+    }
+    char *t = g_tbl + g_tbl_used;
+    unsigned char *f = g_tblf + g_tbl_used;
+    memcpy(t, text, (size_t)len);
+    memcpy(f, flags, (size_t)len);
+    int before = g_nvl;
+    push_vl(*(const int *)ud, t, len);
+    if (g_nvl == before) {
+        g_tbl_fail = 1; /* the wrap index is full; the row was dropped */
+        return;
+    }
+    g_tbl_used += (size_t)len;
+    g_vl[g_nvl - 1].flags = f;
+}
+
+/* Lay out a table starting at `p`, if there is one, and return the source
+ * bytes it consumed. A table that does not fit the arena is rolled back and
+ * left to render as plain text. */
+static int try_table(int kind, const char *p, int len, int maxcols)
+{
+    int vl0 = g_nvl, first0 = g_first_pending, sol0 = g_sol_pending;
+    size_t used0 = g_tbl_used;
+    g_tbl_fail = 0;
+    int consumed = table_render(p, len, maxcols, tbl_emit, &kind);
+    if (consumed > 0 && !g_tbl_fail)
+        return consumed;
+    g_nvl = vl0;
+    g_tbl_used = used0;
+    g_first_pending = first0;
+    g_sol_pending = sol0;
+    return 0;
+}
+
 static unsigned g_vl_gen = (unsigned)-1;
 static int g_vl_cols = -1;
 
@@ -407,6 +458,7 @@ static void build_vlines(int maxcols)
     g_vl_gen = g_gen;
     g_vl_cols = maxcols;
     g_nvl = 0;
+    g_tbl_used = 0;
     for (int it = 0; it < g_nitems; it++) {
         const char *base = g_arena + g_items[it].off;
         int len = (int)g_items[it].len;
@@ -417,21 +469,35 @@ static void build_vlines(int maxcols)
         g_first_pending = 1;
         g_fence_cur = 0;
         int md = g_items[it].kind == UI_ASSISTANT;
+        /* walked a source line at a time: a table needs the line after it */
         int start = 0;
-        for (int i = 0; i <= len; i++) {
-            if (i == len || base[i] == '\n') {
-                int llen = i - start;
-                g_sol_pending = 1;
-                /* a fence marker line is consumed, not shown */
-                if (md && md_is_fence(base + start, llen)) {
-                    g_fence_cur = !g_fence_cur;
-                    g_first_pending = 0;
-                    start = i + 1;
+        while (start <= len) {
+            int e = start;
+            while (e < len && base[e] != '\n')
+                e++;
+            int llen = e - start;
+            g_sol_pending = 1;
+            /* a fence marker line is consumed, not shown */
+            if (md && md_is_fence(base + start, llen)) {
+                g_fence_cur = !g_fence_cur;
+                g_first_pending = 0;
+                start = e + 1;
+                continue;
+            }
+            if (md && !g_fence_cur && llen > 0) {
+                int n = try_table(g_items[it].kind, base + start, len - start,
+                                  maxcols);
+                if (n > 0) {
+                    start += n;
+                    if (start >= len)
+                        break; /* the table ran to the end of the item */
                     continue;
                 }
-                wrap_para(g_items[it].kind, base + start, llen, maxcols);
-                start = i + 1;
             }
+            wrap_para(g_items[it].kind, base + start, llen, maxcols);
+            if (e == len)
+                break;
+            start = e + 1;
         }
     }
 }
@@ -484,6 +550,15 @@ static int clamp_cols(const char *p, int len, int cols)
     return i < len ? i : len;
 }
 
+/* display width of a whole nul-terminated string */
+static int str_cols(const char *s)
+{
+    int len = (int)strlen(s), i = 0, n = 0;
+    while (i < len)
+        n += adv_width(s, len, &i);
+    return n;
+}
+
 static void draw_span(int x, int y, int fg, int attr, const char *p, int len)
 {
     char tmp[4096];
@@ -514,27 +589,22 @@ static uint32_t utf8_cp(const char *p, int len, int *i)
     return cp;
 }
 
-/* draw a visual line with basic markdown styling applied */
-static void draw_markdown(int x, int y, const vline *v, int maxx)
+/* draw a line whose per-byte style flags are already known */
+static void draw_flagged(int x, int y, const char *p, int len,
+                         const unsigned char *flags, int maxx)
 {
-    unsigned char flags[4096];
-    int len = v->len;
-    if (len > (int)sizeof flags)
-        len = (int)sizeof flags;
-    md_state st;
-    st.in_fence = v->fence;
-    md_style(&st, v->p, len, flags, v->sol);
-
     int i = 0;
     while (i < len && x < maxx) {
         unsigned char f = flags[i];
         int at = i;
-        uint32_t cp = utf8_cp(v->p, len, &i);
+        uint32_t cp = utf8_cp(p, len, &i);
         if (f & MD_HIDE)
             continue;
 
         int fg = COL_TEXT, bg = TCOL_DEFAULT, attr = 0;
-        if (f & MD_CODE) {
+        if (f & MD_TBORDER) {
+            fg = COL_GREY;
+        } else if (f & MD_CODE) {
             fg = COL_CODE;
             bg = COL_CODE_BG;
         } else if (f & MD_HEADING) {
@@ -549,7 +619,7 @@ static void draw_markdown(int x, int y, const vline *v, int maxx)
             attr |= TATTR_ITALIC;
         if (f & MD_BULLET) {
             fg = COL_ACCENT;
-            if (v->p[at] == '-' || v->p[at] == '*' || v->p[at] == '+')
+            if (p[at] == '-' || p[at] == '*' || p[at] == '+')
                 cp = 0x2022; /* • */
         }
         int w = term_char_width(cp);
@@ -560,6 +630,19 @@ static void draw_markdown(int x, int y, const vline *v, int maxx)
         term_set(x, y, cp, fg, bg, attr);
         x += w;
     }
+}
+
+/* draw a visual line with basic markdown styling applied */
+static void draw_markdown(int x, int y, const vline *v, int maxx)
+{
+    unsigned char flags[4096];
+    int len = v->len;
+    if (len > (int)sizeof flags)
+        len = (int)sizeof flags;
+    md_state st;
+    st.in_fence = v->fence;
+    md_style(&st, v->p, len, flags, v->sol);
+    draw_flagged(x, y, v->p, len, flags, maxx);
 }
 
 /* ---- frame ------------------------------------------------------------- */
@@ -679,6 +762,80 @@ void ui_badge(const char *text)
         ui_render();
 }
 
+/* ---- modal list picker ------------------------------------------------- */
+static int g_pick_on;
+static const char *g_pick_title;
+static const char *const *g_pick_items;
+static const char *const *g_pick_notes;
+static int g_pick_n, g_pick_sel, g_pick_top;
+
+/* A bordered box anchored to the bottom of the transcript, so the last of
+ * the conversation stays visible above it. */
+static void draw_picker(int x0, int x1, int y1, int rows)
+{
+    int shown = g_pick_n < rows - 2 ? g_pick_n : rows - 2;
+    if (shown < 1)
+        return;
+    if (g_pick_sel < g_pick_top)
+        g_pick_top = g_pick_sel;
+    if (g_pick_sel >= g_pick_top + shown)
+        g_pick_top = g_pick_sel - shown + 1;
+    if (g_pick_top > g_pick_n - shown)
+        g_pick_top = g_pick_n - shown;
+    if (g_pick_top < 0)
+        g_pick_top = 0;
+
+    int y0 = y1 - shown - 1;
+    for (int y = y0; y <= y1; y++)
+        for (int x = x0; x <= x1; x++)
+            term_set(x, y, ' ', COL_TEXT, TCOL_DEFAULT, 0);
+
+    term_set(x0, y0, 0x256D, COL_ACCENT, TCOL_DEFAULT, 0);     /* ╭ */
+    term_set(x1, y0, 0x256E, COL_ACCENT, TCOL_DEFAULT, 0);     /* ╮ */
+    term_set(x0, y1, 0x2570, COL_ACCENT, TCOL_DEFAULT, 0);     /* ╰ */
+    term_set(x1, y1, 0x256F, COL_ACCENT, TCOL_DEFAULT, 0);     /* ╯ */
+    hline(y0, x0 + 1, x1 - 1, COL_ACCENT);
+    hline(y1, x0 + 1, x1 - 1, COL_ACCENT);
+    for (int y = y0 + 1; y < y1; y++) {
+        term_set(x0, y, 0x2502, COL_ACCENT, TCOL_DEFAULT, 0);
+        term_set(x1, y, 0x2502, COL_ACCENT, TCOL_DEFAULT, 0);
+    }
+    if (g_pick_title && *g_pick_title) {
+        int tx0 = x0 + 2;
+        term_set(tx0 - 1, y0, ' ', COL_ACCENT, TCOL_DEFAULT, 0);
+        int w = term_print(tx0, y0, g_pick_title, COL_ACCENT, TCOL_DEFAULT,
+                           TATTR_BOLD);
+        term_set(tx0 + w, y0, ' ', COL_ACCENT, TCOL_DEFAULT, 0);
+    }
+
+    int inner = x1 - x0 - 3; /* columns available after "│ " and "│" */
+    int label = 0;             /* notes line up past the widest item */
+    for (int i = 0; i < g_pick_n; i++) {
+        int w = str_cols(g_pick_items[i]);
+        if (w > label)
+            label = w;
+    }
+    if (label > inner - 4)
+        label = inner - 4;
+
+    for (int r = 0; r < shown; r++) {
+        int i = g_pick_top + r;
+        int y = y0 + 1 + r;
+        int sel = i == g_pick_sel;
+        int x = x0 + 2;
+        x += term_print(x, y, sel ? "❯ " : "  ", COL_ACCENT, TCOL_DEFAULT,
+                        TATTR_BOLD);
+        const char *it = g_pick_items[i];
+        draw_span(x, y, sel ? COL_TEXT : COL_GREY, sel ? TATTR_BOLD : 0, it,
+                  clamp_cols(it, (int)strlen(it), label));
+        const char *note = g_pick_notes ? g_pick_notes[i] : NULL;
+        int nx = x + label + 2;
+        if (note && *note && nx < x1 - 1)
+            draw_span(nx, y, COL_GREY, TATTR_DIM, note,
+                      clamp_cols(note, (int)strlen(note), x1 - 1 - nx));
+    }
+}
+
 /* paint now */
 static void render_now(void)
 {
@@ -745,7 +902,9 @@ static void render_now(void)
         gutter_for(v->kind, &sym, &gfg);
         if (v->first)
             term_print(1 + PAD, 1 + row, sym, gfg, TCOL_DEFAULT, TATTR_BOLD);
-        if (v->kind == UI_ASSISTANT)
+        if (v->flags)
+            draw_flagged(tx, 1 + row, v->p, v->len, v->flags, tx + maxcols);
+        else if (v->kind == UI_ASSISTANT)
             draw_markdown(tx, 1 + row, v, tx + maxcols);
         else
             draw_span(tx, 1 + row, text_fg(v->kind), text_attr(v->kind), v->p,
@@ -810,12 +969,21 @@ static void render_now(void)
             size_t s1 = (row + 1 < g_row_n) ? g_row_off[row + 1] : g_inlen;
             draw_span(tx, in_y0 + r, COL_TEXT, 0, g_inbuf + s0, (int)(s1 - s0));
         }
-        term_show_cursor(tx + cur_col, in_y0 + (cur_row - first));
+        if (!g_pick_on)
+            term_show_cursor(tx + cur_col, in_y0 + (cur_row - first));
+    }
+
+    if (g_pick_on) {
+        term_hide_cursor();
+        draw_picker(1 + PAD, W - 2 - PAD, div_y - 1, th);
     }
 
     /* hint / status line, below the frame */
     char hint[512];
-    if (g_status[0])
+    if (g_pick_on)
+        snprintf(hint, sizeof hint,
+                 "↑/↓ or 1-9 choose · enter select · esc cancel");
+    else if (g_status[0])
         snprintf(hint, sizeof hint, "%s", g_status);
     else
         snprintf(hint, sizeof hint,
@@ -911,6 +1079,55 @@ static int handle_view_event(term_event ev)
     default:
         return 0;
     }
+}
+
+int ui_pick(const char *title, const char *const *items,
+            const char *const *notes, int n, int cur)
+{
+    if (!g_active || n < 1)
+        return -1;
+    g_pick_title = title;
+    g_pick_items = items;
+    g_pick_notes = notes;
+    g_pick_n = n;
+    g_pick_sel = (cur >= 0 && cur < n) ? cur : 0;
+    g_pick_top = 0;
+    g_pick_on = 1;
+
+    int rc = -1;
+    for (;;) {
+        ui_render_force();
+        term_event ev = term_poll(-1);
+        if (ev.type == K_EOF)
+            break;
+        if (ev.type == K_RESIZE)
+            continue;
+        if (ev.type == K_UP || ev.type == K_WHEEL_UP ||
+            (ev.type == K_CTRL && ev.ch == 'p')) {
+            g_pick_sel = g_pick_sel > 0 ? g_pick_sel - 1 : n - 1;
+        } else if (ev.type == K_DOWN || ev.type == K_WHEEL_DOWN ||
+                   ev.type == K_TAB || (ev.type == K_CTRL && ev.ch == 'n')) {
+            g_pick_sel = g_pick_sel + 1 < n ? g_pick_sel + 1 : 0;
+        } else if (ev.type == K_HOME || ev.type == K_PGUP) {
+            g_pick_sel = 0;
+        } else if (ev.type == K_END || ev.type == K_PGDN) {
+            g_pick_sel = n - 1;
+        } else if (ev.type == K_ENTER) {
+            rc = g_pick_sel;
+            break;
+        } else if (ev.type == K_ESC ||
+                   (ev.type == K_CTRL && (ev.ch == 'c' || ev.ch == 'd'))) {
+            break;
+        } else if (ev.type == K_CHAR && ev.ch >= '1' && ev.ch <= '9' &&
+                   (int)(ev.ch - '0') <= n) {
+            rc = (int)(ev.ch - '1'); /* the shortlist is short: pick by digit */
+            break;
+        }
+    }
+
+    g_pick_on = 0;
+    ui_render_force();
+    return rc;
 }
 
 int ui_pump(void)

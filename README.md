@@ -4,7 +4,7 @@ extremely fast portable agent harness in c.
 
 <img src="screenshot.png" alt="lambda tui" width="792">
 
-* fixed-frame tui, scrolls internally, basic markdown
+* fixed-frame tui, scrolls internally, markdown incl. tables
 * portable and statically linked
 * minimal dynamic memory allocation
 * single-file c plugins (exa web search included)
@@ -14,7 +14,7 @@ extremely fast portable agent harness in c.
 
 ```sh
 make            # → ./lambda
-make release    # dead-stripped, symbols removed (~243 kb)
+make release    # dead-stripped, symbols removed (~251 kb)
 make install    # → $(PREFIX)/bin, default /usr/local
 make uninstall
 make test       # unit tests under asan/ubsan
@@ -55,6 +55,10 @@ lambda resume FILE          # continue a specific one
 commands: `/model`, `/system`, `/effort`, `/thinking`, `/tools`, `/clear`,
 `/help`, `/quit`.
 
+bare `/model` opens a picker over the transcript — up/down or `1`-`9` to move,
+enter to switch, esc to cancel. `/model ID` sets any id directly, whether or
+not it is on the list.
+
 keys: enter sends. pgup/pgdn or wheel scroll. ctrl-c interrupts a reply or a
 running command. ctrl-d quits. ctrl-a/e/k/u/w edit, up/down for history.
 
@@ -77,9 +81,41 @@ data retention — not available under zdr. `-m claude-opus-5` switches back.
 thinking/effort params are only sent to models that accept them, so older ids
 like `claude-haiku-4-5` still work.
 
+`/model` lists these, with context window and price per mtok:
+
+| id | ctx | in/out per mtok |
+|---|---:|---|
+| `claude-fable-5` | 1m | $10/$50, no zdr |
+| `claude-opus-5` | 1m | $5/$25 |
+| `claude-opus-4-8` | 1m | $5/$25 |
+| `claude-sonnet-5` | 1m | $3/$15 |
+| `claude-haiku-4-5` | 200k | $1/$5, no thinking |
+
+switching mid-chat keeps the history: thinking blocks replay to the model
+that produced them and are dropped by the others.
+
 refusal fallbacks are on by default for fable/opus-5: if a classifier
 declines, the api retries on a fallback model in the same call and the status
 line notes the switch. `--no-fallback` disables.
+
+## markdown
+
+headings, `**bold**`, `*italic*`, `` `code` ``, fenced blocks, bullets and
+quotes are styled a line at a time as the reply streams.
+
+tables are the exception: column widths depend on every row, so a whole
+github-style table is laid out once the delimiter row arrives, then drawn
+with box rules.
+
+```
+| model | ctx | price |
+|---|:--:|------:|
+| claude-opus-5 | 1m | $5/$25 |
+```
+
+alignment colons are honoured, cells wrap when they must, and the widest
+column is shaved first to fit the frame. too narrow to draw at all and the
+source text is shown instead.
 
 ## context files
 

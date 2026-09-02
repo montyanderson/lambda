@@ -6,7 +6,8 @@
  * which bytes to hide (the markers themselves).
  *
  * Supported: # headings, **bold**, *italic* / _italic_, `code`,
- * ``` fenced blocks, - / 1. list bullets, > quotes. */
+ * ``` fenced blocks, - / 1. list bullets, > quotes.
+ * Tables are laid out separately, in table.c, which reuses these flags. */
 
 #define MD_BOLD 0x01
 #define MD_ITALIC 0x02
@@ -15,6 +16,7 @@
 #define MD_HIDE 0x10   /* marker byte: don't draw */
 #define MD_BULLET 0x20 /* list marker: draw in accent */
 #define MD_QUOTE 0x40
+#define MD_TBORDER 0x80 /* table box-drawing glyph (see table.h) */
 
 /* Block state carried across lines of one item (fenced code blocks). */
 typedef struct {

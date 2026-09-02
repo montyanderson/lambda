@@ -116,6 +116,25 @@ int chat_push_raw(chat *c, const char *json, size_t len)
     return hist_push(c, json, len);
 }
 
+/* The shortlist /model offers. Prices are per million tokens, in/out. */
+static const model_info g_models[] = {
+    {"claude-fable-5", "1m ctx · $10/$50 · no zdr"},
+    {"claude-opus-5", "1m ctx · $5/$25"},
+    {"claude-opus-4-8", "1m ctx · $5/$25"},
+    {"claude-sonnet-5", "1m ctx · $3/$15"},
+    {"claude-haiku-4-5", "200k ctx · $1/$5 · no thinking"},
+};
+
+int chat_model_count(void)
+{
+    return (int)(sizeof g_models / sizeof g_models[0]);
+}
+
+const model_info *chat_model_at(int i)
+{
+    return (i >= 0 && i < chat_model_count()) ? &g_models[i] : NULL;
+}
+
 /* fallbacks only exist on the opus-5 / fable-5 families */
 static int model_has_fallbacks(const char *model)
 {

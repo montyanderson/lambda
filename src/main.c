@@ -14,7 +14,7 @@
 #include <string.h>
 #include <unistd.h>
 
-#define LAMBDA_VERSION "0.6.0"
+#define LAMBDA_VERSION "0.7.0"
 
 static void on_sigint(int sig)
 {
@@ -55,7 +55,7 @@ static void usage(void)
 
 static const char *HELP_TEXT =
     "commands:\n"
-    "  /model [ID]   show or switch model\n"
+    "  /model [ID]   pick a model from a list, or switch to ID\n"
     "  /system TEXT  set system prompt (empty clears)\n"
     "  /effort [L]   show or set reasoning effort\n"
     "  /thinking     toggle showing the model's reasoning\n"
@@ -84,6 +84,44 @@ static void refresh_badge(chat *c)
     if (t.len && b[t.len - 1] == ' ')
         b[t.len - 1] = '\0';
     ui_badge(b);
+}
+
+static void set_model(chat *c, const char *id)
+{
+    chat_set_model(c, id);
+    ui_set_model(id);
+    session_meta("model", id);
+}
+
+/* `/model` with no argument: pick from the shortlist. Returns 0 if the user
+ * backed out, so the caller can leave the transcript untouched. */
+static int choose_model(chat *c)
+{
+    int n = chat_model_count();
+    const char *ids[16];
+    const char *notes[16];
+    char noteb[16][96];
+    int cur = -1;
+
+    if (n > (int)(sizeof ids / sizeof ids[0]))
+        n = (int)(sizeof ids / sizeof ids[0]);
+    for (int i = 0; i < n; i++) {
+        const model_info *m = chat_model_at(i);
+        int is_cur = strcmp(m->id, chat_model(c)) == 0;
+        if (is_cur)
+            cur = i;
+        ids[i] = m->id;
+        snprintf(noteb[i], sizeof noteb[i], "%s%s",
+                 is_cur ? "current · " : "", m->note);
+        notes[i] = noteb[i];
+    }
+
+    int sel = ui_pick("select model", ids, notes, n, cur);
+    if (sel < 0)
+        return 0;
+    if (sel != cur)
+        set_model(c, ids[sel]);
+    return 1;
 }
 
 static int slash_command(chat *c, const char *line)
@@ -132,11 +170,10 @@ static int slash_command(chat *c, const char *line)
         const char *arg = line + 6;
         while (*arg == ' ')
             arg++;
-        if (*arg) {
-            chat_set_model(c, arg);
-            ui_set_model(arg);
-            session_meta("model", arg);
-        }
+        if (*arg)
+            set_model(c, arg);
+        else if (choose_model(c) == 0)
+            return 0; /* cancelled: leave the transcript alone */
         snprintf(msg, sizeof msg, "model: %s", chat_model(c));
         ui_add(UI_NOTICE, msg);
     } else if (strncmp(line, "/system", 7) == 0) {
@@ -315,6 +352,24 @@ int main(int argc, char **argv)
     /* Test hook: seed the transcript so the scroll/repaint tests can run
      * without an api key. Env-only, so it stays off the cli surface. */
     {
+        const char *md = getenv("LAMBDA_SELFTEST_MD");
+        if (md && *md == '1')
+            ui_add(UI_ASSISTANT,
+                   "here is **the** shortlist:\n"
+                   "\n"
+                   "| model | ctx | price |\n"
+                   "|---|:--:|------:|\n"
+                   "| `claude-opus-5` | 1m | $5/$25 |\n"
+                   "| claude-haiku-4-5 | 200k | $1/$5 |\n"
+                   "\n"
+                   "that is all.");
+        if (md && *md == '2') /* a table inside a fence stays verbatim */
+            ui_add(UI_ASSISTANT,
+                   "```\n"
+                   "| fenced | table |\n"
+                   "|---|---|\n"
+                   "| stays | verbatim |\n"
+                   "```");
         const char *fill = getenv("LAMBDA_SELFTEST_FILL");
         if (fill && *fill) {
             long n = strtol(fill, NULL, 10);

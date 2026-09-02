@@ -12,6 +12,7 @@
 #include <sys/ioctl.h>
 #include <sys/select.h>
 #include <termios.h>
+#include <time.h>
 #include <unistd.h>
 
 #define MAX_COLS 512
@@ -591,6 +592,20 @@ static term_event decode(void)
     return ev_make(K_CHAR, cp);
 }
 
+/* A lone 0x1b is ambiguous: it is either the escape key or the first byte of
+ * a sequence still in flight. Waiting this long settles it — long enough for
+ * the rest of a sequence to arrive even over ssh, short enough that the key
+ * still feels immediate. */
+#define ESC_WAIT_MS 30
+static long g_esc_ms; /* when the pending lone escape showed up */
+
+static long mono_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
 term_event term_poll(int timeout_ms)
 {
     if (g_resized) {
@@ -604,7 +619,26 @@ term_event term_poll(int timeout_ms)
             return e;
         if (e.ch == 1) /* decoded-and-ignored (e.g. mouse move): keep going */
             continue;
-        int r = fill(timeout_ms);
+
+        int r;
+        if (g_inlen == 1 && g_in[0] == 0x1b) {
+            long now = mono_ms();
+            if (!g_esc_ms)
+                g_esc_ms = now;
+            long left = ESC_WAIT_MS - (now - g_esc_ms);
+            if (left <= 0) {
+                g_esc_ms = 0;
+                consume(1);
+                return ev_make(K_ESC, 0);
+            }
+            /* never wait past what the caller asked for */
+            r = fill(timeout_ms >= 0 && timeout_ms < left ? timeout_ms
+                                                          : (int)left);
+        } else {
+            g_esc_ms = 0;
+            r = fill(timeout_ms);
+        }
+
         if (r < 0)
             return ev_make(K_EOF, 0);
         if (g_resized) {
@@ -612,7 +646,11 @@ term_event term_poll(int timeout_ms)
             update_size();
             return ev_make(K_RESIZE, 0);
         }
-        if (r == 0)
+        if (r == 0) {
+            /* the escape settled: go round once more and emit it */
+            if (g_esc_ms && mono_ms() - g_esc_ms >= ESC_WAIT_MS)
+                continue;
             return ev_make(K_NONE, 0);
+        }
     }
 }

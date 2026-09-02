@@ -88,16 +88,18 @@ uninstall:
 
 # Tests include the translation unit under test so they can reach its static
 # state, so they compile their own dependencies rather than linking build/.
-# The arena is shrunk right down so compaction is exercised in a short run.
+# The arenas are shrunk right down so compaction and the table-layout
+# fallback are both exercised in a short run.
 TEST_SRC   := $(filter-out tests/term_harness.c,$(wildcard tests/*.c))
 TEST_BIN   := $(patsubst tests/%.c,build/tests/%,$(TEST_SRC))
 TEST_CFLAGS := -std=c99 -Wall -Wextra -O1 -g -fsanitize=address,undefined
-TEST_DEFS   := -DLAMBDA_TRANSCRIPT_ARENA=4096 -DLAMBDA_MAX_ITEMS=8
+TEST_DEFS   := -DLAMBDA_TRANSCRIPT_ARENA=4096 -DLAMBDA_MAX_ITEMS=8 \
+               -DLAMBDA_TABLE_ARENA=4096
 
 build/tests/%: tests/%.c $(wildcard src/*.c) $(wildcard src/*.h)
 	@mkdir -p $(dir $@)
 	$(CC) $(TEST_CFLAGS) $(CPPFLAGS) $(TEST_DEFS) -o $@ $< \
-	    src/term.c src/md.c src/util.c
+	    src/term.c src/md.c src/table.c src/util.c
 
 test: $(TEST_BIN)
 	@for t in $(TEST_BIN); do echo "== $$t"; $$t || exit 1; done

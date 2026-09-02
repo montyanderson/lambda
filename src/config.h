@@ -39,6 +39,9 @@
 #define LAMBDA_MAX_ITEMS 4096              /* transcript items */
 #endif
 #define LAMBDA_WRAP_LINES 65536            /* wrapped visual lines index */
+#ifndef LAMBDA_TABLE_ARENA
+#define LAMBDA_TABLE_ARENA (256u << 10)    /* formatted markdown tables */
+#endif
 
 #define LAMBDA_PLUGINS_MAX 32          /* registered plugin tools */
 #define LAMBDA_PLUGIN_OUT_MAX (512u << 10) /* raw plugin http response */

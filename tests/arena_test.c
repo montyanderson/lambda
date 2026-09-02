@@ -14,6 +14,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "../src/util.h"
+
 /* ui.c references this; the real definition lives in http.c, which we do not
  * want to link here */
 volatile sig_atomic_t http_interrupted = 0;
@@ -101,6 +103,40 @@ int main(void)
         item_open(UI_TOOL_OUT);
         item_extend(huge, sizeof huge);
         check_invariants(9100);
+    }
+
+    /* 5. tables are laid out into a second arena, indexed by the same wrap
+     * pass. A table too big for it must fall back to plain text rather than
+     * emit half a box, so every wrapped line has to stay inside its item. */
+    if (!failures) {
+        static char big[1 << 16];
+        buf b;
+        buf_attach(&b, big, sizeof big);
+        buf_appends(&b, "| a | b |\n| --- | ---: |\n");
+        for (int i = 0; i < 900; i++)
+            buf_appendf(&b, "| row %d | %d |\n", i, i * 7);
+        item_open(UI_ASSISTANT);
+        item_extend(big, b.len);
+        check_invariants(9200);
+        for (int cols = 8; cols <= 200; cols += 17) {
+            g_gen++; /* force a rebuild at this width */
+            build_vlines(cols);
+            for (int i = 0; i < g_nvl; i++) {
+                const vline *v = &g_vl[i];
+                int inside_arena = v->p >= g_arena &&
+                                   v->p + v->len <= g_arena + g_used;
+                int inside_tbl = v->p >= g_tbl &&
+                                 v->p + v->len <= g_tbl + g_tbl_used;
+                if (v->len < 0 || (!inside_arena && !inside_tbl))
+                    fail("wrapped line points outside both arenas", 9200);
+                if ((v->flags != NULL) != (inside_tbl != 0))
+                    fail("style flags do not match the line's arena", 9200);
+                if (failures)
+                    break;
+            }
+            if (failures)
+                break;
+        }
     }
 
     if (failures) {

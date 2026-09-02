@@ -44,6 +44,13 @@ int ui_queued_count(void);
 /* right-hand indicators in the top border ("" clears) */
 void ui_badge(const char *text);
 
+/* Modal list over the transcript: up/down or 1-9 to move, enter to choose,
+ * esc to cancel. `notes[i]` is optional trailing detail and may be NULL, as
+ * may `notes` itself. Returns the chosen index, or -1 if cancelled or if
+ * there is no tui. */
+int ui_pick(const char *title, const char *const *items,
+            const char *const *notes, int n, int cur);
+
 /* ui_render coalesces repaints (~40fps ceiling); ui_render_force paints now */
 void ui_render(void);
 void ui_render_force(void);

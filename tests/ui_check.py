@@ -10,6 +10,9 @@ two classes of bug live here, both of which shipped once:
   stale frames — repaints are coalesced, so a burst of scroll events can
   defer the final frame. if nothing later flushes it the screen sits on an
   old frame, which reads as the display sticking mid-scroll.
+
+  markdown tables and the /model picker are laid out against the frame
+  width, so they are checked on a real screen rather than in isolation.
 """
 import fcntl, os, pty, select, struct, subprocess, sys, termios, time
 
@@ -126,8 +129,130 @@ def stale_frames():
         pass
 
 
+class Term:
+    """lambda on a pty, with an independent emulator watching the output."""
+
+    def __init__(self, rows, cols, env=None):
+        self.rows, self.cols = rows, cols
+        self.pid, self.fd = pty.fork()
+        if self.pid == 0:
+            os.environ["TERM"] = "xterm-256color"
+            os.environ.pop("ANTHROPIC_API_KEY", None)
+            os.environ.update(env or {})
+            os.execv(LAMBDA, ["lambda", "--no-log", "--no-context"])
+        fcntl.ioctl(self.fd, termios.TIOCSWINSZ,
+                    struct.pack("HHHH", rows, cols, 0, 0))
+        self.screen = pyte.Screen(cols, rows)
+        self.stream = pyte.ByteStream(self.screen)
+
+    def pump(self, sec):
+        end = time.time() + sec
+        while time.time() < end:
+            r, _, _ = select.select([self.fd], [], [], 0.02)
+            if r:
+                try:
+                    d = os.read(self.fd, 65536)
+                except OSError:
+                    return
+                if not d:
+                    return
+                self.stream.feed(d)
+
+    def send(self, data, sec=0.6):
+        os.write(self.fd, data)
+        self.pump(sec)
+
+    def rows_text(self):
+        return ["".join(c if (c := self.screen.buffer[y][x].data) else " "
+                        for x in range(self.cols)) for y in range(self.rows)]
+
+    def close(self):
+        try:
+            os.write(self.fd, b"\x04")
+            self.pump(0.3)
+            os.kill(self.pid, 9)
+            os.waitpid(self.pid, 0)
+        except OSError:
+            pass
+
+
+def markdown_tables():
+    """a table must come out rectangular, with its bars in one column, at
+    every frame width."""
+    print("markdown tables")
+    for COLS in (100, 76, 52, 40, 34):
+        t = Term(24, COLS, {"LAMBDA_SELFTEST_MD": "1"})
+        t.pump(1.5)
+        rows = [r for r in t.rows_text() if "│" in r and ("┬" in r or "┼" in r
+                or "┴" in r or r.count("│") > 2)]
+        t.close()
+        if len(rows) < 6:
+            fail(f"{COLS} cols: found {len(rows)} table rows, want 6")
+            continue
+        # the transcript frame's own bars sit at column 0 and COLS-1; the
+        # table's are everything in between, and must line up
+        cols_of = [tuple(i for i, ch in enumerate(r)
+                         if ch in "│┬┼┴├┤╭╮╰╯" and 0 < i < COLS - 1)
+                   for r in rows]
+        if len(set(cols_of)) != 1:
+            fail(f"{COLS} cols: table bars do not line up: "
+                 f"{sorted(set(cols_of))[:2]}")
+        else:
+            print(f"  {COLS} cols: {len(rows)} rows, bars at {cols_of[0]}")
+
+
+def fenced_table():
+    """a table inside a ``` block is code, and must not be reformatted."""
+    print("tables inside code fences")
+    t = Term(24, 80, {"LAMBDA_SELFTEST_MD": "2"})
+    t.pump(1.5)
+    rows = t.rows_text()
+    t.close()
+    body = "\n".join(rows)
+    if "| fenced | table |" not in body:
+        fail("the fenced table's source text is not on screen")
+    if any(ch in body for ch in "┬┼┴"):
+        fail("a fenced table was laid out as a table")
+    else:
+        print("  left verbatim")
+
+
+def model_picker():
+    """/model opens a list, and choosing from it retitles the frame."""
+    print("model picker")
+    t = Term(24, 80)
+    t.pump(1.5)
+    t.send(b"/model\r", 0.8)
+    body = "\n".join(t.rows_text())
+    if "select model" not in body:
+        fail("/model did not open the picker")
+    if "claude-opus-5" not in body:
+        fail("the picker did not list the shortlist")
+    if "esc cancel" not in body:
+        fail("the picker did not say how to get out")
+
+    t.send(b"\x1b", 0.6)  # esc: nothing changes
+    if "select model" in "\n".join(t.rows_text()):
+        fail("esc did not close the picker")
+    if "claude-fable-5" not in t.rows_text()[0]:
+        fail("cancelling the picker changed the model")
+
+    t.send(b"/model\r", 0.8)
+    t.send(b"\x1b[B", 0.4)  # down one, onto claude-opus-5
+    t.send(b"\r", 0.8)
+    top = t.rows_text()[0]
+    if "claude-opus-5" not in top:
+        fail(f"picking a model did not retitle the frame: {top.strip()!r}")
+    else:
+        print("  opened, cancelled, and switched model")
+    t.close()
+
+
 render_fidelity()
 stale_frames()
+markdown_tables()
+fenced_table()
+model_picker()
 print()
 if failures:
     print(f"ui_check: {failures} failure(s)")

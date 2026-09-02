@@ -14,6 +14,17 @@ void chat_clear(chat *c); /* drop conversation history */
 
 const char *chat_model(const chat *c);
 void chat_set_model(chat *c, const char *model);
+
+/* Models offered by /model. Any other id can still be set by hand — this is
+ * the shortlist the picker shows, not a whitelist. */
+typedef struct {
+    const char *id;
+    const char *note; /* context window · price per mtok */
+} model_info;
+
+int chat_model_count(void);
+const model_info *chat_model_at(int i);
+
 void chat_set_system(chat *c, const char *system);
 void chat_set_fallbacks(chat *c, int on);
 /* output_config.effort: "low".."max", or NULL/"" to leave it to the api */
