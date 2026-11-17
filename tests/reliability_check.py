@@ -292,7 +292,23 @@ while not pathlib.Path("hook-release").exists(): time.sleep(.01)
     hook.chmod(0o700)
     command = ("git -C terminal-git -c core.hooksPath=.git/hooks -c commit.gpgSign=false "
                "-c user.name=Fixture -c user.email=fixture@example.invalid commit --allow-empty -qm fixture")
-    f.reset(lambda b, n: reply(block(0, "tool_use", args={"command": command})) if n == 1 else reply())
+    class PasswordServer(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *args): pass
+        def do_GET(self):
+            self.send_response(401)
+            self.send_header("WWW-Authenticate", 'Basic realm="git fixture"')
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+    auth = http.server.ThreadingHTTPServer(("127.0.0.1", 0), PasswordServer)
+    threading.Thread(target=auth.serve_forever, daemon=True).start()
+    auth_command = ("LC_ALL=C GIT_TERMINAL_PROMPT=1 GIT_ASKPASS='' SSH_ASKPASS='' "
+                    "git -c core.askPass= -c credential.helper= -c credential.username=fixture-user ls-remote "
+                    f"http://fixture-user@127.0.0.1:{auth.server_port}/repo.git")
+    def respond(body, n):
+        if n == 1: return reply(block(0, "tool_use", args={"command": command}))
+        if n == 2: return reply(block(0, "tool_use", args={"command": auth_command}))
+        return reply()
+    f.reset(respond)
     pid, fd = pty.fork()
     if pid == 0:
         os.chdir(f.directory)
@@ -313,19 +329,23 @@ while not pathlib.Path("hook-release").exists(): time.sleep(.01)
         os.write(fd, b"queued during git\r")
         until(lambda: b"queued during git" in output)
         release.touch()
-        until(lambda: len(f.requests) == 3)
+        until(lambda: len(f.requests) == 4)
         result = f.requests[1]["messages"][-1]["content"][0]["content"]
         assert "hook-stdout-captured" in result and "hook-stderr-captured" in result, result
         assert "GIT-TERMINAL-BYPASS".encode() not in output, "git bypassed tool capture through /dev/tty"
         assert "controlling-terminal-unavailable" in result, result
-        assert f.requests[2]["messages"][-1]["content"] == "queued during git"
+        auth_result = f.requests[2]["messages"][-1]["content"][0]
+        assert auth_result["is_error"] and "could not read Password" in auth_result["content"], auth_result
+        assert f.requests[3]["messages"][-1]["content"] == "queued during git"
         assert not f.errors, f.errors
     finally:
         release.touch()
         os.kill(pid, signal.SIGTERM)
         os.waitpid(pid, 0)
         os.close(fd)
-    print("terminal: real git hook stdout/stderr captured, /dev/tty isolated, queued input preserved: ok", flush=True)
+        auth.shutdown()
+        auth.server_close()
+    print("terminal: git hook capture, /dev/tty isolation, HTTP password failure returned to agent, queued input preserved: ok", flush=True)
 
 
 def queue_check(f):
