@@ -19,7 +19,8 @@ const char *TOOL_BASH_JSON =
     "{\"name\":\"bash\","
     "\"description\":\"Run a shell command on the user's machine via "
     "/bin/sh -c. stdout and stderr are captured (output is truncated if "
-    "very long). Runs from the current working directory; state such as cd "
+    "very long). Noninteractive: stdin is /dev/null and there is no controlling terminal. "
+    "Runs from the current working directory; state such as cd "
     "and environment variables does not persist between calls.\","
     "\"input_schema\":{\"type\":\"object\",\"properties\":{"
     "\"command\":{\"type\":\"string\",\"description\":\"The shell command "
@@ -40,9 +41,6 @@ int tool_bash(const char *command, buf *out, int (*poll)(void))
         return -1;
     }
     if (pid == 0) {
-        /* own process group: cancelling kills the whole job, not just the
-         * shell — otherwise grandchildren keep the pipe open and we hang */
-        setpgid(0, 0);
         close(pfd[0]);
         /* Tools are noninteractive. Sharing the TUI's input descriptor lets
          * a child consume keystrokes intended for queued prompts. */
@@ -51,15 +49,25 @@ int tool_bash(const char *command, buf *out, int (*poll)(void))
             _exit(127);
         if (input != STDIN_FILENO)
             close(input);
-        dup2(pfd[1], STDOUT_FILENO);
-        dup2(pfd[1], STDERR_FILENO);
-        close(pfd[1]);
+        if (dup2(pfd[1], STDOUT_FILENO) < 0 || dup2(pfd[1], STDERR_FILENO) < 0)
+            _exit(127);
+        if (pfd[1] > STDERR_FILENO)
+            close(pfd[1]);
+        /* A process group alone still shares the controlling terminal:
+         * git/ssh helpers can reopen /dev/tty and bypass our pipes. A new
+         * session detaches it and gives the whole job its own process group. */
+        if (setsid() < 0) {
+            dprintf(STDERR_FILENO, "lambda: cannot detach tool terminal: %s\n", strerror(errno));
+            _exit(127);
+        }
         signal(SIGINT, SIG_DFL);
         signal(SIGPIPE, SIG_DFL);
         execl("/bin/sh", "sh", "-c", command, (char *)NULL);
         _exit(127);
     }
-    setpgid(pid, pid); /* also set in the parent, to close the race */
+    /* Do not setpgid here: making the child a group leader would make its
+     * setsid fail. Cancellation signals the child too until it is reaped,
+     * covering the short interval before its new session exists. */
     close(pfd[1]);
 
     const int watch_input = poll && ui_is_tty();
@@ -73,9 +81,11 @@ int tool_bash(const char *command, buf *out, int (*poll)(void))
         if (http_interrupted) {
             if (!killed) {
                 kill(-pid, SIGTERM);
+                if (!exited) kill(pid, SIGTERM);
                 killed = 1;
             } else if (++kill_ticks == 8) { /* ~1s grace, then insist */
                 kill(-pid, SIGKILL);
+                if (!exited) kill(pid, SIGKILL);
             }
         }
         if (!exited) {
@@ -103,6 +113,7 @@ int tool_bash(const char *command, buf *out, int (*poll)(void))
             if (errno == EINTR)
                 continue;
             kill(-pid, SIGKILL);
+            if (!exited) kill(pid, SIGKILL);
             break;
         }
         if (r == 0)

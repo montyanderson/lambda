@@ -267,6 +267,67 @@ def check(f):
     print("failures: 429/500 preserve side effects; SIGINT cancels closed-output child and remaining tools; crash recovery: ok", flush=True)
 
 
+def terminal_isolation_check(f):
+    # Git hooks/credential helpers can open /dev/tty even when fd 0/1/2
+    # have been redirected. Run real git under Lambda's controlling PTY.
+    repo = f.directory / "terminal-git"
+    env = {**f.env, "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1"}
+    subprocess.run(["git", "init", "-q", str(repo)], env=env, check=True)
+    ready, release = repo / "hook-ready", repo / "hook-release"
+    hook = repo / ".git/hooks/pre-commit"
+    hook.write_text('''#!/usr/bin/env python3
+import os, pathlib, time
+print("hook-stdout-captured", flush=True)
+os.write(2, b"hook-stderr-captured\\n")
+try:
+    fd = os.open("/dev/tty", os.O_RDWR | os.O_NONBLOCK)
+except OSError:
+    print("controlling-terminal-unavailable", flush=True)
+else:
+    os.write(fd, b"GIT-TERMINAL-BYPASS\\n")
+    os.close(fd)
+pathlib.Path("hook-ready").touch()
+while not pathlib.Path("hook-release").exists(): time.sleep(.01)
+''')
+    hook.chmod(0o700)
+    command = ("git -C terminal-git -c core.hooksPath=.git/hooks -c commit.gpgSign=false "
+               "-c user.name=Fixture -c user.email=fixture@example.invalid commit --allow-empty -qm fixture")
+    f.reset(lambda b, n: reply(block(0, "tool_use", args={"command": command})) if n == 1 else reply())
+    pid, fd = pty.fork()
+    if pid == 0:
+        os.chdir(f.directory)
+        os.execve(BINARY, f.args + ["--no-log"], env)
+    fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 120, 0, 0))
+    output = bytearray()
+    def until(predicate):
+        end = time.monotonic() + 6
+        while time.monotonic() < end:
+            if select.select([fd], [], [], .02)[0]:
+                output.extend(os.read(fd, 65536))
+            if predicate(): return
+        raise AssertionError(bytes(output[-1500:]))
+    try:
+        until(lambda: b"type a message" in output)
+        os.write(fd, b"commit using git\r")
+        until(ready.exists)
+        os.write(fd, b"queued during git\r")
+        until(lambda: b"queued during git" in output)
+        release.touch()
+        until(lambda: len(f.requests) == 3)
+        result = f.requests[1]["messages"][-1]["content"][0]["content"]
+        assert "hook-stdout-captured" in result and "hook-stderr-captured" in result, result
+        assert "GIT-TERMINAL-BYPASS".encode() not in output, "git bypassed tool capture through /dev/tty"
+        assert "controlling-terminal-unavailable" in result, result
+        assert f.requests[2]["messages"][-1]["content"] == "queued during git"
+        assert not f.errors, f.errors
+    finally:
+        release.touch()
+        os.kill(pid, signal.SIGTERM)
+        os.waitpid(pid, 0)
+        os.close(fd)
+    print("terminal: real git hook stdout/stderr captured, /dev/tty isolated, queued input preserved: ok", flush=True)
+
+
 def queue_check(f):
     entered, release = threading.Event(), threading.Event()
     status = [200]
@@ -343,6 +404,7 @@ def main():
         f=Fixture(directory)
         try:
             check(f)
+            terminal_isolation_check(f)
             queue_check(f)
         finally: f.close()
     print("all reliability checks passed",flush=True)

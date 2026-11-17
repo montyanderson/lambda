@@ -376,9 +376,12 @@ not. transcript locks are released when the process exits or is killed.
 
 ## bash tool
 
-runs `/bin/sh -c` in its own process group from the cwd. stdout+stderr merged,
-truncated at 64 kb, non-zero exit reported to the model. no state persists
-between calls. ctrl-c signals the whole group.
+runs `/bin/sh -c` in its own session and process group from the cwd.
+stdout+stderr are merged and captured, truncated at 64 kb, with non-zero exit
+reported to the model. stdin is `/dev/null`; tools have no controlling terminal,
+so git/ssh helpers cannot reopen `/dev/tty` to write over the tui or read your
+keystrokes. commands that require terminal input must use a noninteractive
+alternative. no shell state persists between calls. ctrl-c signals the whole group.
 
 **no approval prompt** — if claude decides to run something, it runs. don't
 point it at a directory you'd mind it changing. `--no-tools` disables.
