@@ -116,7 +116,7 @@ def check():
         thread.start()
         base = f"http://127.0.0.1:{server.server_port}/gateway"
         env = {k: v for k, v in os.environ.items()
-               if k not in ("LITELLM_BASE_URL", "LITELLM_PROXY_URL", "LITELLM_API_KEY", "EXA_API_KEY")}
+               if k not in ("LITELLM_BASE_URL", "LITELLM_PROXY_URL", "LITELLM_API_KEY", "EXA_API_KEY", "LAMBDA_MOUSE")}
         env.update(XDG_CONFIG_HOME=tmp, NO_COLOR="1", ANTHROPIC_API_KEY="never-send-this",
                    TERM="xterm-256color")
         cfg = Path(tmp) / "lambda" / "config.json"
@@ -255,7 +255,8 @@ def check():
             os.write(fd, b"/model\r")
             drain()
             assert b"\x1b[?2004h" in initial
-            assert b"\x1b[?1000h" not in initial
+            assert b"\x1b[?1000h" in initial
+            assert b"\x1b[?1006h" in initial
             assert b"\x1b[?1000l" in initial
             os.write(fd, b"no-such-model")
             assert b"no matching models" in drain()
@@ -301,7 +302,7 @@ def check():
             body = state["requests"][-1][2]
             assert body["messages"][-1]["content"] == "first line\n\tsecond line ✓"
             assert len([body for _, _, body in state["requests"] if body is not None]) == 1
-            print("clipboard: native selection enabled, fragmented multiline paste submitted once on Enter: ok")
+            print("clipboard: fragmented multiline paste submitted once on Enter; mouse scrolling enabled: ok")
 
             os.write(fd, b"/model provider/model-042\r")
             drain()
@@ -318,7 +319,7 @@ def check():
             child, child_fd = pty.fork()
             if child == 0:
                 os.chdir(tmp)
-                os.execve(BINARY, [BINARY, "--no-log", "--no-context"], env)
+                os.execve(BINARY, [BINARY, "--no-log", "--no-context"], {**env, "LAMBDA_MOUSE": "0"})
             try:
                 output = b""
                 end = time.monotonic() + 1
@@ -326,6 +327,7 @@ def check():
                     if select.select([child_fd], [], [], 0.05)[0]:
                         output += os.read(child_fd, 65536)
                 assert b"select model" not in output and b"provider/model-042" in output
+                assert b"\x1b[?1000h" not in output and b"\x1b[?1000l" in output
             finally:
                 os.kill(child, signal.SIGTERM)
                 os.waitpid(child, 0)

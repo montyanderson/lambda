@@ -73,13 +73,15 @@ page keys to move, enter to switch, esc to cancel. ctrl-u clears the filter.
 lists of nine or fewer models also accept `1`–`9` as selection shortcuts.
 `/model ID` sets any id directly, whether or not it is on the list.
 
-keys: enter sends. pgup/pgdn scroll. ctrl-c interrupts a reply or a
+keys: enter sends. mouse wheel/trackpad or pgup/pgdn scroll the conversation.
+scrolling up holds your position while replies and tool output arrive;
+scroll back to the bottom to follow new output again. ctrl-c interrupts a reply or a
 running command. ctrl-d quits. ctrl-a/e/k/u/w edit, up/down for history.
 
-drag to select text and use your terminal's copy/paste shortcuts. bracketed
-paste keeps multiline text in the input until you press enter. mouse capture
-is off by default; `LAMBDA_MOUSE=1 lambda` enables wheel scrolling, with
-shift-drag selection in terminals that support it.
+shift-drag to select text in terminals that support it, then use your terminal's
+copy/paste shortcuts. bracketed paste keeps multiline text in the input until
+you press enter. `LAMBDA_MOUSE=0 lambda` disables mouse capture for native
+drag selection; pgup/pgdn still scroll the conversation.
 
 the input stays live while the model works — enter queues instead of
 interrupting. queued prompts show above the input marked `»` and run in order.

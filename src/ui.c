@@ -265,7 +265,6 @@ void ui_add(int kind, const char *text)
     }
     item_open(kind);
     item_extend(text, strlen(text));
-    g_follow = 1;
     ui_render();
 }
 
@@ -285,7 +284,6 @@ void ui_stream_begin(int kind)
     }
     item_open(kind);
     g_streaming = 1;
-    g_follow = 1;
 }
 
 void ui_stream_delta(const char *text)
@@ -301,7 +299,6 @@ void ui_stream_delta(const char *text)
         return;
     }
     item_extend(text, strlen(text));
-    g_follow = 1;
     ui_render();
 }
 

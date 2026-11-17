@@ -178,11 +178,11 @@ int term_init(void)
     update_size();
     outs("\x1b[?1049h"); /* alternate screen */
     outs("\x1b[?25l");   /* hide cursor */
-    /* Native terminal selection owns the mouse by default. Opt in to wheel
-     * reporting when desired; Shift-drag then bypasses it in most terminals. */
+    /* Wheel scrolling works by default. Shift-drag bypasses mouse capture
+     * in most terminals; LAMBDA_MOUSE=0 keeps native selection instead. */
     outs("\x1b[?1006l\x1b[?1000l"); /* reset modes left by an interrupted process */
     const char *mouse = getenv("LAMBDA_MOUSE");
-    if (mouse && strcmp(mouse, "1") == 0)
+    if (!mouse || strcmp(mouse, "0") != 0)
         outs("\x1b[?1000h\x1b[?1006h");
     outs("\x1b[?2004h"); /* bracketed paste: newlines are input, not Enter */
     outs("\x1b[2J");

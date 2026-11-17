@@ -102,11 +102,14 @@ def stale_frames():
                           (b"\x1b[6~", 4, "PgDn x4"),
                           (b"\x1b[<64;10;10M", 12, "wheel-up x12"),
                           (b"\x1b[<65;10;10M", 10, "wheel-down x10")]:
+        before = snap()
         for _ in range(n):          # faster than the coalescing window
             os.write(fd, seq)
             time.sleep(0.004)
         pump(1.0)
         settled = snap()
+        if settled[1:-4] == before[1:-4]:
+            fail(f"{label}: history did not move")
         # a resize forces an unconditional full repaint: ground truth
         fcntl.ioctl(fd, termios.TIOCSWINSZ,
                     struct.pack("HHHH", ROWS, COLS - 1, 0, 0))

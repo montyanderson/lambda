@@ -151,6 +151,30 @@ int main(void)
         fail("large item was truncated", 9301);
     if (g_nvl <= 0) fail("missing visual lines", 9302);
 
+    /* Reading older history must survive new messages, tool output and every
+     * streamed chunk. Only scrolling back to the bottom resumes following. */
+    g_tty = 1;
+    build_vlines(view_cols());
+    g_scroll = g_nvl - view_rows();
+    scroll_by(-20);
+    int position = g_scroll;
+    if (g_follow) fail("scrolling up did not pause following", 9400);
+    ui_add(UI_USER, "queued prompt");
+    ui_add(UI_TOOL_OUT, "new tool output");
+    ui_stream_begin(UI_ASSISTANT);
+    ui_stream_delta("reply chunk one\n");
+    ui_stream_delta("reply chunk two\n");
+    ui_stream_end();
+    if (g_follow || g_scroll != position)
+        fail("new output moved the history view", 9401);
+    scroll_by(g_nvl);
+    if (!g_follow || g_scroll != g_nvl - view_rows())
+        fail("scrolling to the bottom did not resume following", 9402);
+    ui_stream_begin(UI_ASSISTANT);
+    ui_stream_delta("following again");
+    ui_stream_end();
+    if (!g_follow) fail("new output stopped following at the bottom", 9403);
+
     if (failures) {
         printf("arena_test: %d failure(s)\n", failures);
         return 1;
