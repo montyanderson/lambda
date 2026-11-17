@@ -55,7 +55,7 @@ lambda resume FILE          # continue a specific one
 | `--context-window N` | override automatic context-window detection |
 | `-s SYSTEM` | system prompt |
 | `-p PROMPT` | one-shot, then exit |
-| `-e EFFORT` | `low`…`max` reasoning effort |
+| `-e EFFORT` | reasoning effort for this run; `default` leaves it to the provider |
 | `-r FILE` / `-c` | same as `resume FILE` / `resume` |
 | `--no-thinking` | hide reasoning |
 | `--voice` | speak replies through a local audio player |
@@ -212,18 +212,27 @@ list. the fixed catalog holds up to 1024 models; larger lists fail explicitly.
 the proxy may list image, embedding, or retired models: choose a model that
 supports chat (and tool calling when using tools).
 
-on the first interactive launch, lambda asks you to select a model. confirming
-a choice saves it as the default for future launches. `/model` and `/model ID`
-update that default; cancelling the picker leaves it unchanged.
+on the first interactive launch, lambda asks you to select a model, then asks
+for reasoning effort when the model advertises controls. confirming both saves
+the pair as the default for future launches. `/model` and `/model ID` repeat this
+flow; cancelling either picker leaves the current and saved settings unchanged.
+`/effort` opens the effort picker for the current model; `/effort high` changes
+and saves it directly. `default` is a saved choice too, so lambda will not ask
+again on every launch.
 
 the choice is stored in `~/.config/lambda/default-model` (or under
 `$XDG_CONFIG_HOME/lambda`). direct Anthropic uses `default-model-anthropic`
-in the same directory. these private files contain only a model id; credentials
-and other config are left untouched. delete the relevant file to ask again.
-if saving fails, lambda reports it and keeps the selection for the current chat.
+in the same directory. each private file contains the model id on the first line
+and `effort=high` (or `effort=default`, etc.) on the second, written atomically.
+credentials and other config are left untouched. older model-only files still
+load and ask for effort on the next interactive launch. delete the relevant
+file to ask again. if saving fails, lambda reports it and keeps the selection
+for the current chat.
 
 an explicit `-m`, resumed model or saved default skips the startup picker, in
-that order of precedence. `-m` and resume do not overwrite the saved default.
+that order of precedence. `-m`, `-e` and resume do not overwrite the saved default.
+an explicit `-e` overrides the saved or resumed effort; `-m` starts the newly
+specified model at its provider default unless paired with `-e`.
 lambda fetches metadata to size its initial storage; unavailable metadata uses conservative
 defaults. without a saved default, one-shot mode requires `-m` when the proxy
 offers more than one model.
@@ -233,10 +242,39 @@ chat uses LiteLLM's [unified messages endpoint](https://docs.litellm.ai/docs/ant
 which translates streaming replies and tool calls across providers. switching
 models keeps text and tool history, dropping thinking signatures from other
 models. overlapping text, thinking and tool blocks are tracked by their stream
-indexes so an answer cannot be saved as reasoning. direct Anthropic fallback and adaptive-thinking options are omitted
-for the proxy; reasoning settings can be configured on LiteLLM. `/thinking`
-still controls whether returned reasoning is shown. `--max-tokens` adjusts the
+indexes so an answer cannot be saved as reasoning. direct Anthropic fallback
+options are omitted for the proxy. `/thinking` only controls whether returned
+reasoning is shown. `--max-tokens` adjusts the
 proxy's 4096-token default output limit.
+
+### reasoning discovery
+
+lambda reads LiteLLM's `/model_group/info` and `/model/info` under the configured
+proxy prefix. it joins entries by model alias, rather than guessing from the
+alias name. group `supported_reasoning_efforts` and deployment
+`reasoning_effort_levels` supply explicit ladders; deployment flags constrain
+them, and `thinking_always_on` removes `none`. aliases with several deployments
+use their common levels. `default_reasoning_effort` is shown as a hint;
+choosing `default` omits reasoning parameters and lets the proxy decide.
+
+when no ladder is provided but metadata advertises both reasoning and the
+`reasoning_effort` parameter, lambda offers the common low/medium/high levels
+plus any explicitly advertised extensions. unknown capabilities or unavailable
+metadata keep the provider default with a notice. unsupported levels advertised
+by neither the model nor its deployments are not offered. `/models` refreshes
+the capability cache as well as the model list.
+
+selected effort is sent on `/v1/messages` as `thinking.type=adaptive` with
+`output_config.effort`. LiteLLM translates this for native adaptive models,
+legacy Anthropic thinking budgets, and other providers. `none` uses disabled
+thinking for native Anthropic-compatible models, and effort `none` for
+translated models. the common `minimal` tier maps to `low` for native Anthropic models.
+older proxy versions may lack these translations; the
+installed LiteLLM version was checked against its implementation. see
+[LiteLLM reasoning](https://docs.litellm.ai/docs/reasoning_content) and
+[Messages API](https://docs.litellm.ai/docs/anthropic_unified/).
+for budget-based reasoning, `--max-tokens` covers both thinking and the answer;
+allow enough output tokens for both.
 
 ## automatic conversation memory
 
@@ -293,8 +331,8 @@ to the model once its context has been compacted.
 the direct Anthropic fallback is claude fable 5, with `display: "summarized"` so reasoning streams
 live in dim italic under a `✻` gutter. `--no-thinking` hides it.
 
-`-e` sets `output_config.effort`. unset means the api default; `xhigh` for
-long agentic work, `low` for cheap turns.
+`-e` overrides the reasoning setting for one run. saved selections restore it;
+`-e default` leaves effort to the provider. available levels depend on the model.
 
 fable costs ~2x the opus tier ($10/$50 vs $5/$25 per mtok) and needs 30-day
 data retention — not available under zdr. `-m claude-opus-5` switches back.
@@ -309,7 +347,7 @@ like `claude-haiku-4-5` still work.
 | `claude-opus-5` | 1m | $5/$25 |
 | `claude-opus-4-8` | 1m | $5/$25 |
 | `claude-sonnet-5` | 1m | $3/$15 |
-| `claude-haiku-4-5` | 200k | $1/$5, no thinking |
+| `claude-haiku-4-5` | 200k | $1/$5, provider default |
 
 switching mid-chat keeps the history: thinking blocks replay to the model
 that produced them and are dropped by the others.
@@ -586,6 +624,10 @@ it needs no herdr installation, provider credentials, or external network.
 round-trips a 1.2 mb streamed reply through disk and the next request, and
 checks that an allocation failure leaves the existing transcript unchanged.
 it uses a local provider fixture and no credentials.
+
+`make reasoningtest` checks rich capability discovery, constrained effort
+menus, cancellation, paired defaults, old preference migration, CLI/resume
+precedence and the reasoning fields sent to the proxy. it uses local fixtures.
 
 ## limits
 

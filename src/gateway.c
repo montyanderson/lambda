@@ -23,6 +23,8 @@ typedef struct {
 static gateway_model g_catalog[2][LAMBDA_MODELS_MAX];
 static int g_bank, g_count;
 static int g_metadata_attempted;
+static int g_reasoning_attempted;
+static reasoning_options g_reasoning[LAMBDA_MODELS_MAX];
 static char g_response[LAMBDA_MODELS_BODY_MAX];
 static char g_config_key[LAMBDA_REQ_HDRS_MAX];
 
@@ -148,6 +150,7 @@ int gateway_configure(const char *url, char *err, size_t errsz)
     g_gateway.enabled = 1;
     g_count = 0;
     g_metadata_attempted = 0;
+    g_reasoning_attempted = 0;
     return 0;
 invalid:
     snprintf(err, errsz, "invalid LiteLLM URL: use http(s)://host[:port][/prefix] without credentials, query or fragment");
@@ -290,6 +293,8 @@ int gateway_refresh(char *err, size_t errsz)
     }
     g_bank = bank;
     g_count = unique;
+    g_reasoning_attempted = 0;
+    memset(g_reasoning, 0, sizeof g_reasoning);
     return 0;
 }
 
@@ -303,4 +308,144 @@ const model_info *gateway_model_info(const char *id)
         if (strcmp(g_catalog[g_bank][i].id, id) == 0)
             return &g_catalog[g_bank][i].info;
     return NULL;
+}
+
+/* LiteLLM separates the callable alias catalog from capability metadata.
+ * Group levels are useful, but deployment overrides/always-on flags win. */
+static int json_bool(const jdoc *d, int obj, const char *key)
+{
+    int i = j_get(d, obj, key);
+    if (i < 0 || d->toks[i].type != JSMN_PRIMITIVE) return 0;
+    const char *p = d->js + d->toks[i].start;
+    size_t n = (size_t)(d->toks[i].end - d->toks[i].start);
+    if (n == 4 && !memcmp(p, "true", 4)) return 1;
+    if (n == 5 && !memcmp(p, "false", 5)) return -1;
+    return 0;
+}
+
+static int array_has(const jdoc *d, int obj, const char *key, const char *value)
+{
+    int a = j_get(d, obj, key);
+    for (int i = 0; i < j_count(d, a); i++)
+        if (j_is(d, j_elem(d, a, i), value)) return 1;
+    return 0;
+}
+
+static void merge_reasoning(const jdoc *d, int obj, reasoning_options *out)
+{
+    int support = json_bool(d, obj, "supports_reasoning");
+    if (support) out->supported = support;
+    int effort_param = array_has(d, obj, "supported_openai_params", "reasoning_effort");
+    if (!out->supported && effort_param) out->supported = 1;
+    /* The common effort interface is low/medium/high. Extra levels require
+     * advertised support; an explicit ladder below replaces this baseline. */
+    if (out->supported == 1 && !out->levels && effort_param)
+        out->levels = (1u << 3) | (1u << 4) | (1u << 5);
+    int explicit_levels = 0;
+    const char *lists[] = {"supported_reasoning_efforts", "reasoning_effort_levels"};
+    for (size_t k = 0; k < sizeof lists / sizeof lists[0]; k++) {
+        int a = j_get(d, obj, lists[k]);
+        if (a < 0 || d->toks[a].type != JSMN_ARRAY) continue;
+        explicit_levels = 1;
+        out->levels = 0;
+        for (int i = 0; i < j_count(d, a); i++)
+            for (int level = 1; level < REASONING_LEVELS; level++)
+                if (j_is(d, j_elem(d, a, i), reasoning_name(level))) out->levels |= 1u << level;
+        if (out->levels && !support) out->supported = 1;
+    }
+    for (int i = 1; i < REASONING_LEVELS; i++) {
+        char key[64];
+        snprintf(key, sizeof key, "supports_%s_reasoning_effort", reasoning_name(i));
+        int flag = json_bool(d, obj, key);
+        if (flag == 1 && !explicit_levels) out->levels |= 1u << i;
+        else if (flag == -1) out->levels &= ~(1u << i);
+    }
+    if (json_bool(d, obj, "thinking_always_on") == 1) out->always_on = 1;
+    const char *native_providers[] = {"anthropic", "bedrock", "vertex_ai", "azure_ai"};
+    if (array_has(d, obj, "supported_openai_params", "thinking"))
+        for (size_t i = 0; i < sizeof native_providers / sizeof native_providers[0]; i++)
+            if (j_is(d, j_get(d, obj, "litellm_provider"), native_providers[i]) ||
+                array_has(d, obj, "providers", native_providers[i])) out->native_thinking = 1;
+    if (json_bool(d, obj, "supports_adaptive_thinking") == 1 ||
+        json_bool(d, obj, "supports_anthropic_thinking_payload") == 1 ||
+        j_is(d, j_get(d, obj, "litellm_provider"), "anthropic") ||
+        array_has(d, obj, "providers", "anthropic")) out->native_thinking = 1;
+    if (out->always_on) out->levels &= ~(1u << 1);
+    if (out->supported == -1) out->levels = 0;
+    int def = j_get(d, obj, "default_reasoning_effort");
+    if (def >= 0) {
+        buf value;
+        char store[16];
+        buf_attach(&value, store, sizeof store);
+        out->default_effort[0] = '\0';
+        if (j_str_tok(d, def, &value) == 0 && !value.overflow && reasoning_index(store) > 0)
+            snprintf(out->default_effort, sizeof out->default_effort, "%s", store);
+    }
+}
+
+static void receive_metadata(const char *data, size_t len, void *ud)
+{
+    buf *b = ud;
+    if (b->overflow) return;
+    if (len > (16u << 20) - b->len) { b->overflow = 1; return; }
+    buf_append(b, data, len);
+}
+
+static void read_reasoning_metadata(const char *endpoint, int deployments)
+{
+    char header_store[LAMBDA_REQ_HDRS_MAX], path_store[2048], err[512];
+    buf headers, path, response = {.grow = 1};
+    buf_attach(&headers, header_store, sizeof header_store);
+    buf_attach(&path, path_store, sizeof path_store);
+    if (gateway_headers(&headers, err, sizeof err) != 0) return;
+    int status = 0;
+    http_request req = {.method = "GET", .extra_headers = headers.data, .status = &status,
+        .on_body = receive_metadata, .body_ud = &response, .on_idle = discovery_idle,
+        .watch_input = ui_is_tty()};
+    /* Management endpoints live under the configured prefix, outside /v1. */
+    buf_appendf(&path, "%s/%s", g_gateway.prefix, endpoint);
+    req.host = g_gateway.host; req.port = g_gateway.port;
+    req.plain_http = g_gateway.plain; req.path = path.data;
+    if (path.overflow || http_post(&req, err, sizeof err) != HTTP_OK || status != 200 || response.overflow) goto done;
+    jdoc d;
+    if (jdoc_parse(&d, response.data ? response.data : "", response.len) != 0) goto done;
+    int data = j_get(&d, 0, "data");
+    if (data < 0 || d.toks[data].type != JSMN_ARRAY) goto done;
+    unsigned char seen[LAMBDA_MODELS_MAX] = {0};
+    for (int i = 0; i < j_count(&d, data); i++) {
+        int entry = j_elem(&d, data, i);
+        char name[LAMBDA_MODEL_ID_MAX]; buf b;
+        buf_attach(&b, name, sizeof name);
+        if (j_str(&d, entry, deployments ? "model_name" : "model_group", &b) != 0 || b.overflow) continue;
+        for (int m = 0; m < g_count; m++) {
+            if (strcmp(name, g_catalog[g_bank][m].id)) continue;
+            reasoning_options candidate = g_reasoning[m];
+            int obj = deployments ? j_get(&d, entry, "model_info") : entry;
+            merge_reasoning(&d, obj, &candidate);
+            if (seen[m]) {
+                /* A load-balanced alias must work on every deployment. */
+                candidate.levels &= g_reasoning[m].levels;
+                if (g_reasoning[m].supported == -1) candidate.supported = -1;
+                if (strcmp(candidate.default_effort, g_reasoning[m].default_effort)) candidate.default_effort[0] = '\0';
+            }
+            g_reasoning[m] = candidate;
+            seen[m] = 1;
+            break;
+        }
+    }
+done:
+    buf_free(&response);
+}
+
+void gateway_reasoning(const char *id, reasoning_options *out)
+{
+    memset(out, 0, sizeof *out);
+    gateway_model_info(id);
+    if (!g_reasoning_attempted) {
+        g_reasoning_attempted = 1;
+        read_reasoning_metadata("model_group/info", 0);
+        if (!http_interrupted) read_reasoning_metadata("model/info", 1);
+    }
+    for (int i = 0; i < g_count; i++)
+        if (!strcmp(g_catalog[g_bank][i].id, id)) { *out = g_reasoning[i]; return; }
 }

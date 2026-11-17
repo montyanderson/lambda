@@ -48,7 +48,7 @@ static void usage(void)
            "  -p PROMPT      one-shot prompt, then exit\n"
            "  -r, --resume F resume a transcript (.lambda/chats/*.jsonl)\n"
            "  -c, --continue resume the most recent transcript\n"
-           "  -e EFFORT      low|medium|high|xhigh|max (default: api's own)\n"
+           "  -e EFFORT      override reasoning effort for this run (or default)\n"
            "  --no-thinking  hide the model's reasoning while it works\n"
            "  --voice        speak replies with Inworld (mpv, mpg123 or ffplay)\n"
            "  --voice-id ID  choose an Inworld voice (overrides INWORLD_VOICE_ID)\n"
@@ -82,7 +82,7 @@ static const char *HELP_TEXT =
     "  /context      show context usage and automatic summary threshold\n"
     "  /compact      summarise older conversation now\n"
     "  /system TEXT  set system prompt (empty clears)\n"
-    "  /effort [L]   show or set reasoning effort\n"
+    "  /effort [L]   pick or set reasoning effort and save it with the model\n"
     "  /thinking     toggle showing the model's reasoning\n"
     "  /voice [on|off|stop] toggle speech, or stop current playback\n"
     "  /tools        toggle the bash tool\n"
@@ -174,14 +174,73 @@ static int set_model(chat *c, const char *id)
     return 0;
 }
 
-static int select_model(chat *c, const char *id)
+static void save_selection(chat *c)
 {
-    if (set_model(c, id) != 0) return -1;
-    if (preferences_model_save(gateway_enabled(), id) != 0) {
+    if (preferences_save(gateway_enabled(), chat_model(c), chat_effort(c)) != 0) {
         char msg[256];
         snprintf(msg, sizeof msg, "model selected for this chat, but could not save default: %s", strerror(errno));
         ui_add(UI_ERROR, msg);
     }
+}
+
+static int pick_effort(const char *id, const char *current, char *out, size_t cap)
+{
+    reasoning_options options;
+    ui_status("loading reasoning options…");
+    ui_render_force();
+    chat_reasoning_options(id, &options);
+    ui_status(NULL);
+    if (http_interrupted) return -1;
+    out[0] = '\0';
+    if (!options.levels || options.supported == -1) {
+        ui_add(UI_NOTICE, options.supported == -1 ? "this model does not advertise reasoning controls" :
+               "reasoning options unavailable; using the provider default");
+        return 0;
+    }
+    const char *names[REASONING_LEVELS], *notes[REASONING_LEVELS];
+    int levels[REASONING_LEVELS], n = 1, cur = 0;
+    char default_note[96];
+    snprintf(default_note, sizeof default_note, "provider decides%s%s",
+             options.default_effort[0] ? " · advertised: " : "", options.default_effort);
+    names[0] = "default"; notes[0] = default_note; levels[0] = 0;
+    for (int i = 1; i < REASONING_LEVELS; i++) {
+        if (!(options.levels & (1u << i))) continue;
+        names[n] = reasoning_name(i);
+        notes[n] = i == 1 ? "disable reasoning" : i <= 3 ? "less reasoning" :
+                   i >= 6 ? "more reasoning" : "";
+        levels[n] = i;
+        if (current && !strcmp(current, names[n])) cur = n;
+        n++;
+    }
+    char title[160];
+    snprintf(title, sizeof title, "reasoning effort · %.100s", id);
+    int sel = ui_pick(title, names, notes, n, cur);
+    if (sel < 0) return -1;
+    snprintf(out, cap, "%s", reasoning_name(levels[sel]));
+    return 0;
+}
+
+static int effort_allowed(const char *id, const char *effort)
+{
+    int i = reasoning_index(effort);
+    if (i < 0) return 0;
+    if (!i) return 1;
+    reasoning_options options;
+    chat_reasoning_options(id, &options);
+    return options.supported != -1 && (!options.levels || (options.levels & (1u << i))) &&
+           !(options.always_on && i == 1);
+}
+
+static int select_model(chat *c, const char *id)
+{
+    char effort[16];
+    if (pick_effort(id, !strcmp(id, chat_model(c)) ? chat_effort(c) : "",
+                    effort, sizeof effort) != 0) return -1;
+    if (set_model(c, id) != 0) return -1;
+    chat_set_effort(c, effort);
+    session_meta("effort", effort);
+    refresh_badge(c);
+    save_selection(c);
     return 0;
 }
 
@@ -264,21 +323,23 @@ static int slash_command(chat *c, const char *line)
             ui_add(UI_ERROR, http_interrupted ? "interrupted; history preserved" : msg);
         else
             ui_add(UI_NOTICE, rc ? "conversation memory updated" : "nothing to summarise yet");
-    } else if (strncmp(line, "/effort", 7) == 0) {
+    } else if (!strcmp(line, "/effort") || !strncmp(line, "/effort ", 8)) {
         const char *arg = line + 7;
         while (*arg == ' ')
             arg++;
-        if (*arg) {
-            if (strcmp(arg, "low") && strcmp(arg, "medium") &&
-                strcmp(arg, "high") && strcmp(arg, "xhigh") &&
-                strcmp(arg, "max")) {
-                ui_add(UI_NOTICE, "effort must be low|medium|high|xhigh|max");
-                return 0;
-            }
-            chat_set_effort(c, arg);
-            session_meta("effort", arg);
-            refresh_badge(c);
+        char selected[16];
+        if (!*arg) {
+            if (pick_effort(chat_model(c), chat_effort(c), selected, sizeof selected) != 0) return 0;
+            arg = selected;
         }
+        if (!effort_allowed(chat_model(c), arg)) {
+            ui_add(UI_NOTICE, "unsupported effort for this model; use /effort to see available settings");
+            return 0;
+        }
+        chat_set_effort(c, reasoning_name(reasoning_index(arg)));
+        session_meta("effort", chat_effort(c));
+        refresh_badge(c);
+        save_selection(c);
         snprintf(msg, sizeof msg, "effort: %s",
                  chat_effort(c)[0] ? chat_effort(c) : "(api default)");
         ui_add(UI_NOTICE, msg);
@@ -369,7 +430,7 @@ int main(int argc, char **argv)
     const char *oneshot = NULL;
     const char *resume_path = NULL;
     /* explicit flags outrank whatever a resumed transcript recorded */
-    const char *cli_model = NULL, *cli_system = NULL;
+    const char *cli_model = NULL, *cli_system = NULL, *cli_effort = NULL;
     const char *litellm_url = getenv("LITELLM_BASE_URL");
     if (!litellm_url || !*litellm_url)
         litellm_url = getenv("LITELLM_PROXY_URL");
@@ -435,7 +496,12 @@ int main(int argc, char **argv)
             show_thinking = 0;
             chat_set_show_thinking(c, 0);
         } else if (strcmp(a, "-e") == 0 && i + 1 < argc) {
-            chat_set_effort(c, argv[++i]);
+            cli_effort = argv[++i];
+            if (reasoning_index(cli_effort) < 0) {
+                fprintf(stderr, "lambda: effort must be default|none|minimal|low|medium|high|xhigh|max\n");
+                return 2;
+            }
+            chat_set_effort(c, reasoning_name(reasoning_index(cli_effort)));
         } else if (strcmp(a, "--no-log") == 0) {
             no_log = 1;
         } else if (strcmp(a, "--no-context") == 0) {
@@ -484,10 +550,13 @@ int main(int argc, char **argv)
         return 0;
     }
 
-    char saved_model[LAMBDA_MODEL_ID_MAX];
-    int saved = preferences_model_load(gateway_enabled(), saved_model, sizeof saved_model);
+    model_preference preference;
+    int saved = preferences_load(gateway_enabled(), &preference);
     int preference_error = saved < 0 ? errno : 0;
-    if (saved == 1 && !cli_model) chat_set_model(c, saved_model);
+    if (saved == 1 && !cli_model) {
+        chat_set_model(c, preference.model);
+        if (!cli_effort) chat_set_effort(c, preference.effort);
+    }
 
     if (cli_voice && voice_enable(1, err, sizeof err) != 0) {
         fprintf(stderr, "lambda: %s\n", err);
@@ -526,6 +595,7 @@ int main(int argc, char **argv)
     if (!no_log) {
         char msg[LAMBDA_PATH_MAX + 128];
         if (resume_path) {
+            chat_set_effort(c, ""); /* the transcript outranks global defaults */
             snprintf(msg, sizeof msg, "resuming %s", resume_path);
             ui_add(UI_NOTICE, msg);
             int n = session_resume(resume_path, c);
@@ -552,6 +622,7 @@ int main(int argc, char **argv)
             ui_add(UI_NOTICE, "could not open a transcript; not recording");
         }
     } else if (resume_path) {
+        chat_set_effort(c, "");
         /* resume the history without recording anything further */
         if (session_resume(resume_path, c) >= 0) {
             restored = 1;
@@ -570,6 +641,9 @@ int main(int argc, char **argv)
             return 1;
         }
     }
+
+    if (restored && cli_model) chat_set_effort(c, "");
+    if (cli_effort) chat_set_effort(c, reasoning_name(reasoning_index(cli_effort)));
 
     /* Persist an explicit system prompt for resume without putting its text
      * into Herdr's shell command (it may contain newlines or private context). */
@@ -601,12 +675,29 @@ int main(int argc, char **argv)
         }
     }
 
+    if (saved == 1 && !cli_model && !cli_effort && !restored && !preference.effort_set && ui_is_tty() && !oneshot)
+        select_model(c, chat_model(c)); /* migrate the old model-only default */
+
+    if (cli_effort) chat_set_effort(c, reasoning_name(reasoning_index(cli_effort)));
+    if (!effort_allowed(chat_model(c), chat_effort(c))) {
+        if (cli_effort) {
+            ui_add(UI_ERROR, "selected reasoning effort is not supported by this model");
+            session_close(); ui_shutdown(); return 2;
+        }
+        ui_add(UI_NOTICE, "saved reasoning effort is no longer supported; using the provider default");
+        chat_set_effort(c, "");
+        session_meta("effort", "");
+    }
+
     if (chat_prepare_storage(c) != 0) {
         ui_add(UI_ERROR, "not enough memory for the selected model");
         session_close();
         ui_shutdown();
         return 1;
     }
+
+    if (chat_effort(c)[0] || (restored && (cli_model || cli_effort)))
+        session_meta("effort", chat_effort(c));
 
     if (oneshot) {
         int rc = send_reply(c, oneshot, 1);

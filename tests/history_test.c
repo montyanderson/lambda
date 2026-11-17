@@ -4,6 +4,7 @@
 #include "../src/api.c"
 
 int gateway_enabled(void) { return 0; }
+void gateway_reasoning(const char *id, reasoning_options *out) { (void)id; memset(out, 0, sizeof *out); }
 const model_info *gateway_model_info(const char *id) { (void)id; return NULL; }
 int gateway_model_count(void) { return 0; }
 const model_info *gateway_model_at(int i) { (void)i; return NULL; }

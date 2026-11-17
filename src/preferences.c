@@ -1,5 +1,6 @@
 #include "preferences.h"
 #include "config.h"
+#include "reasoning.h"
 
 #include <errno.h>
 #include <stdio.h>
@@ -30,29 +31,42 @@ static int valid_model(const char *model, size_t len)
     return 1;
 }
 
-int preferences_model_load(int gateway, char *out, size_t cap)
+int preferences_load(int gateway, model_preference *out)
 {
-    char path[LAMBDA_PATH_MAX], data[LAMBDA_MODEL_ID_MAX + 1];
+    memset(out, 0, sizeof *out);
+    char path[LAMBDA_PATH_MAX], data[LAMBDA_MODEL_ID_MAX + 64];
     if (model_path(gateway, path, sizeof path) != 0)
         return errno == ENOENT ? 0 : -1;
     FILE *f = fopen(path, "r");
     if (!f) return errno == ENOENT ? 0 : -1;
-    size_t len = fread(data, 1, sizeof data, f);
+    size_t len = fread(data, 1, sizeof data - 1, f);
     int error = ferror(f) ? EIO : 0;
     fclose(f);
     if (error) { errno = error; return -1; }
+    if (len == sizeof data - 1) { errno = EINVAL; return -1; }
     if (len && data[len - 1] == '\n') len--;
-    if (len >= cap || !valid_model(data, len)) { errno = EINVAL; return -1; }
-    memcpy(out, data, len);
-    out[len] = '\0';
+    data[len] = '\0';
+    char *line = memchr(data, '\n', len);
+    size_t model_len = line ? (size_t)(line - data) : len;
+    if (!valid_model(data, model_len)) { errno = EINVAL; return -1; }
+    if (line) {
+        const char *value = line + 1;
+        if (strncmp(value, "effort=", 7) || strlen(data) != len ||
+            reasoning_index(value + 7) < 0) { errno = EINVAL; return -1; }
+        snprintf(out->effort, sizeof out->effort, "%s", reasoning_name(reasoning_index(value + 7)));
+        out->effort_set = 1;
+    }
+    memcpy(out->model, data, model_len);
+    out->model[model_len] = '\0';
     return 1;
 }
 
-int preferences_model_save(int gateway, const char *model)
+int preferences_save(int gateway, const char *model, const char *effort)
 {
     char path[LAMBDA_PATH_MAX], temp[LAMBDA_PATH_MAX + 16];
     size_t len = strlen(model);
-    if (!valid_model(model, len)) { errno = EINVAL; return -1; }
+    int level = reasoning_index(effort);
+    if (!valid_model(model, len) || level < 0) { errno = EINVAL; return -1; }
     if (model_path(gateway, path, sizeof path) != 0) return -1;
     /* Create missing config parents without touching an existing config file. */
     for (char *p = path + 1; *p; p++) {
@@ -65,9 +79,9 @@ int preferences_model_save(int gateway, const char *model)
     snprintf(temp, sizeof temp, "%s.XXXXXX", path);
     int fd = mkstemp(temp);
     if (fd < 0) return -1;
-    char data[LAMBDA_MODEL_ID_MAX + 1];
-    memcpy(data, model, len);
-    data[len++] = '\n';
+    char data[LAMBDA_MODEL_ID_MAX + 64];
+    len = (size_t)snprintf(data, sizeof data, "%s\neffort=%s\n", model,
+                          level ? reasoning_name(level) : "default");
     int error = 0;
     for (size_t off = 0; off < len;) {
         ssize_t n = write(fd, data + off, len - off);

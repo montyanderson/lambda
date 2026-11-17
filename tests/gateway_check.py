@@ -262,7 +262,7 @@ def check():
             assert b"no matching models" in drain()
             os.write(fd, b"\x15MODEL-029\r")  # ctrl-u; case-insensitive filter
             drain()
-            assert preference.read_text() == "provider/model-029\n"
+            assert preference.read_text() == "provider/model-029\neffort=default\n"
             assert preference.stat().st_mode & 0o777 == 0o600
             state["requests"].clear()
             os.write(fd, b"hello\r")
@@ -275,7 +275,7 @@ def check():
             os.write(fd, b"again\r")
             drain(0.5)
             assert state["requests"][-1][2]["model"] == "provider/model-299"
-            assert preference.read_text() == "provider/model-299\n"
+            assert preference.read_text() == "provider/model-299\neffort=default\n"
             assert len(state["requests"][-1][2]["messages"]) == 3
             # A failed refresh must leave the last good catalog selectable.
             state["mode"] = "auth"
@@ -287,7 +287,7 @@ def check():
             os.write(fd, b"again\r")
             drain(0.5)
             assert state["requests"][-1][2]["model"] == "provider/model-111"
-            assert preference.read_text() == "provider/model-111\n"
+            assert preference.read_text() == "provider/model-111\neffort=default\n"
             print("picker: startup, search, no matches, >16 entries, refresh failure, mid-chat switching: ok")
 
             state["requests"].clear()
@@ -306,14 +306,14 @@ def check():
 
             os.write(fd, b"/model provider/model-042\r")
             drain()
-            assert preference.read_text() == "provider/model-042\n"
+            assert preference.read_text() == "provider/model-042\neffort=default\n"
             run("--no-log", "-p", "saved default")
             assert state["requests"][-1][2]["model"] == "provider/model-042"
             run("--no-log", "-m", "override-model", "-p", "override")
             assert state["requests"][-1][2]["model"] == "override-model"
             run("--no-log", "-r", str(transcript), "-p", "resume")
             assert state["requests"][-1][2]["model"] == "test-model"
-            assert preference.read_text() == "provider/model-042\n"
+            assert preference.read_text() == "provider/model-042\neffort=default\n"
             assert cfg.read_bytes() == config_before
 
             child, child_fd = pty.fork()

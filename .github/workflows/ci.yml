@@ -70,6 +70,8 @@ jobs:
         run: make herdrtest
       - name: Full history, large replies and allocation failure
         run: make historytest
+      - name: Reasoning discovery, selection, persistence and request settings
+        run: make reasoningtest
 
   static:
     name: static link (glibc)

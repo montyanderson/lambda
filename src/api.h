@@ -2,6 +2,7 @@
 #define LAMBDA_API_H
 
 #include <stddef.h>
+#include "reasoning.h"
 
 #define LAMBDA_DEFAULT_MODEL "claude-fable-5"
 
@@ -39,6 +40,7 @@ typedef struct {
 
 int chat_model_count(void);
 const model_info *chat_model_at(int i);
+void chat_reasoning_options(const char *id, reasoning_options *out);
 
 void chat_set_system(chat *c, const char *system);
 void chat_set_fallbacks(chat *c, int on);

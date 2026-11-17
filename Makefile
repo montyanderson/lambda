@@ -141,6 +141,9 @@ herdrtest: lambda
 historytest: lambda
 	$(PYTHON) tests/full_history_check.py
 
+reasoningtest: lambda
+	$(PYTHON) tests/reasoning_check.py
+
 # Explicit opt-in: uses the configured gateway and paid Lyber models.
 livetest: lambda
 	$(PYTHON) tests/live_gateway_check.py
@@ -148,4 +151,4 @@ livetest: lambda
 clean:
 	rm -rf build lambda
 
-.PHONY: clean release install uninstall test uitest apitest contexttest sessiontest reliabilitytest herdrtest historytest livetest
+.PHONY: clean release install uninstall test uitest apitest contexttest sessiontest reliabilitytest herdrtest historytest reasoningtest livetest

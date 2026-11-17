@@ -232,9 +232,12 @@ def remembered_direct_model():
             t.pump(0.8)
             if "select model" not in "\n".join(t.rows_text()):
                 fail("first direct launch did not ask for a model")
-            t.send(b"\r", 0.5)  # confirming the already-highlighted default saves it too
+            t.send(b"\r", 0.5)  # model confirmation opens the effort picker
+            if "reasoning effort" not in "\n".join(t.rows_text()):
+                fail("model confirmation did not ask for reasoning effort")
+            t.send(b"\r", 0.5)  # keep the provider default
             with open(os.path.join(directory, "lambda", "default-model-anthropic")) as f:
-                if f.read() != "claude-fable-5\n":
+                if f.read() != "claude-fable-5\neffort=default\n":
                     fail("confirming the current model did not save it")
         finally:
             t.close()
@@ -270,6 +273,7 @@ def model_picker():
     t.send(b"/model\r", 0.8)
     t.send(b"\x1b[B", 0.4)  # down one, onto claude-opus-5
     t.send(b"\r", 0.8)
+    t.send(b"\r", 0.5)  # confirm reasoning default
     top = t.rows_text()[0]
     if "claude-opus-5" not in top:
         fail(f"picking a model did not retitle the frame: {top.strip()!r}")

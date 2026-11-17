@@ -105,7 +105,7 @@ int chat_set_model(chat *c, const char *m)
         c->context_cap = 0;
         c->observed_tokens = c->observed_estimate = 0;
     }
-    snprintf(c->model, sizeof c->model, "%s", m);
+    memmove(c->model, m, strlen(m) + 1);
     return 0;
 }
 void chat_set_max_tokens(chat *c, int n) { c->max_tokens = n; }
@@ -228,7 +228,7 @@ static const model_info g_models[] = {
     {"claude-opus-5", "1m ctx · $5/$25", 1000000, 0},
     {"claude-opus-4-8", "1m ctx · $5/$25", 1000000, 0},
     {"claude-sonnet-5", "1m ctx · $3/$15", 1000000, 0},
-    {"claude-haiku-4-5", "200k ctx · $1/$5 · no thinking", 200000, 0},
+    {"claude-haiku-4-5", "200k ctx · $1/$5 · provider default", 200000, 0},
 };
 
 int chat_model_count(void)
@@ -351,6 +351,21 @@ static int model_is_modern(const char *model)
         if (strncmp(model, fams[i], strlen(fams[i])) == 0)
             return 1;
     return 0;
+}
+
+void chat_reasoning_options(const char *id, reasoning_options *out)
+{
+    memset(out, 0, sizeof *out);
+    if (gateway_enabled()) { gateway_reasoning(id, out); return; }
+    if (model_is_modern(id)) {
+        out->supported = 1;
+        out->native_thinking = 1;
+        out->levels = (1u << 3) | (1u << 4) | (1u << 5);
+        if (strstr(id, "opus") || strstr(id, "fable") || strstr(id, "mythos")) {
+            out->levels |= 1u << 7;
+            if (!strstr(id, "4-6")) out->levels |= 1u << 6;
+        }
+    }
 }
 
 /* ---- streamed turn state ------------------------------------------------ */
@@ -819,6 +834,21 @@ static void build_body(chat *c, buf *b, int count_only)
         if (c->effort[0]) {
             buf_appends(b, ",\"output_config\":{\"effort\":");
             buf_append_json_str(b, c->effort);
+            buf_appends(b, "}");
+        }
+    }
+    if (!count_only && gateway_enabled() && c->effort[0]) {
+        reasoning_options options;
+        chat_reasoning_options(c->model, &options);
+        if (!strcmp(c->effort, "none") && options.native_thinking) {
+            buf_appends(b, ",\"thinking\":{\"type\":\"disabled\"}");
+        } else {
+            /* LiteLLM translates this Messages shape to native adaptive
+             * thinking, legacy budgets, or other providers' effort fields. */
+            buf_appends(b, ",\"thinking\":{\"type\":\"adaptive\"},\"output_config\":{\"effort\":");
+            /* LiteLLM's common minimal tier maps to low on native Claude;
+             * minimal itself is not a native output_config effort value. */
+            buf_append_json_str(b, options.native_thinking && !strcmp(c->effort, "minimal") ? "low" : c->effort);
             buf_appends(b, "}");
         }
     }

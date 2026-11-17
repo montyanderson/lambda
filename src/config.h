@@ -15,7 +15,7 @@
 #define LAMBDA_SSE_PENDING_MAX (64u << 10) /* unsplit sse stream bytes */
 #define LAMBDA_SSE_DATA_MAX (64u << 10)    /* one sse event payload */
 #define LAMBDA_ERRBODY_MAX (16u << 10)     /* non-200 response body */
-#define LAMBDA_JSON_TOKENS 32768           /* includes large model catalogs */
+#define LAMBDA_JSON_TOKENS 131072          /* includes rich deployment catalogs */
 
 #define LAMBDA_REQ_HDRS_MAX 8192        /* extra request headers */
 #define LAMBDA_RESP_HDR_MAX (32u << 10) /* response header block */
