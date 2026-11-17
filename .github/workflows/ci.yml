@@ -58,6 +58,16 @@ jobs:
         run: make
       - name: terminal fidelity and stale-frame checks
         run: make uitest
+      - name: LiteLLM protocol and model picker checks
+        run: make apitest
+      - name: automatic context compaction and resume checks
+        run: make contexttest
+      - name: concurrent transcript ownership checks
+        run: make sessiontest
+      - name: API failures, tool side effects, interrupts and queued prompts
+        run: make reliabilitytest
+      - name: Herdr lifecycle, session restore and unavailable-server checks
+        run: make herdrtest
 
   static:
     name: static link (glibc)

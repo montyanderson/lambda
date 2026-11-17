@@ -10,11 +10,16 @@
 #define LAMBDA_BODY_MAX (16u << 20)      /* request body build buffer */
 #define LAMBDA_REPLY_MAX (1u << 20)      /* one streamed reply */
 #define LAMBDA_SYSTEM_MAX 8192           /* system prompt */
+#define LAMBDA_MODEL_ID_MAX 512
+#define LAMBDA_MODELS_MAX 1024
+#define LAMBDA_MODELS_BODY_MAX (2u << 20)
+#define LAMBDA_SUMMARY_MAX (32u << 10)
+#define LAMBDA_UNKNOWN_CONTEXT 32768
 
 #define LAMBDA_SSE_PENDING_MAX (64u << 10) /* unsplit sse stream bytes */
 #define LAMBDA_SSE_DATA_MAX (64u << 10)    /* one sse event payload */
 #define LAMBDA_ERRBODY_MAX (16u << 10)     /* non-200 response body */
-#define LAMBDA_JSON_TOKENS 8192            /* jsmn tokens per payload */
+#define LAMBDA_JSON_TOKENS 32768           /* includes large model catalogs */
 
 #define LAMBDA_REQ_HDRS_MAX 8192        /* extra request headers */
 #define LAMBDA_RESP_HDR_MAX (32u << 10) /* response header block */

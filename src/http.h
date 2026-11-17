@@ -11,6 +11,8 @@ typedef struct {
     const char *host;          /* e.g. "api.anthropic.com" */
     const char *port;          /* e.g. "443" */
     const char *path;          /* e.g. "/v1/messages" */
+    const char *method;        /* NULL defaults to POST */
+    int plain_http;            /* explicitly opt out of TLS for http:// */
     const char *extra_headers; /* preformatted "K: V\r\n" lines, may be NULL */
     const char *body;
     size_t body_len;

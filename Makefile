@@ -96,10 +96,13 @@ TEST_CFLAGS := -std=c99 -Wall -Wextra -O1 -g -fsanitize=address,undefined
 TEST_DEFS   := -DLAMBDA_TRANSCRIPT_ARENA=4096 -DLAMBDA_MAX_ITEMS=8 \
                -DLAMBDA_TABLE_ARENA=4096
 
+build/tests/api_stream_test build/tests/http_parser_test: TEST_CFLAGS += -ffunction-sections -fdata-sections $(GC_LDFLAGS)
+build/tests/http_parser_test: TEST_EXTRA_SRC = vendor/picohttpparser/picohttpparser.c
+
 build/tests/%: tests/%.c $(wildcard src/*.c) $(wildcard src/*.h)
 	@mkdir -p $(dir $@)
 	$(CC) $(TEST_CFLAGS) $(CPPFLAGS) $(TEST_DEFS) -o $@ $< \
-	    src/term.c src/md.c src/table.c src/util.c
+	    src/term.c src/md.c src/table.c src/util.c $(TEST_EXTRA_SRC)
 
 test: $(TEST_BIN)
 	@for t in $(TEST_BIN); do echo "== $$t"; $$t || exit 1; done
@@ -117,7 +120,26 @@ build/tests/term_harness: tests/term_harness.c src/term.c src/term.h
 uitest: build/tests/term_harness lambda
 	$(PYTHON) tests/ui_check.py
 
+apitest: lambda
+	$(PYTHON) tests/gateway_check.py
+
+contexttest: lambda
+	$(PYTHON) tests/context_check.py
+
+sessiontest: lambda
+	$(PYTHON) tests/session_check.py
+
+reliabilitytest: lambda
+	$(PYTHON) tests/reliability_check.py
+
+herdrtest: lambda
+	$(PYTHON) tests/herdr_check.py
+
+# Explicit opt-in: uses the configured gateway and paid Lyber models.
+livetest: lambda
+	$(PYTHON) tests/live_gateway_check.py
+
 clean:
 	rm -rf build lambda
 
-.PHONY: clean release install uninstall test uitest
+.PHONY: clean release install uninstall test uitest apitest contexttest sessiontest reliabilitytest herdrtest livetest

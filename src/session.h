@@ -16,12 +16,15 @@
  *   {"t":"msg","m":{"role":...,"content":...}}   verbatim api message
  *   {"t":"drop","n":N}                           last N msgs were rolled back
  *   {"t":"meta","k":...,"v":...}                 model/system changes
+ *   {"t":"compact","drop":N,"pin":I,"summary":...} prefix -> memory
+ *   {"t":"clear"}                                clear messages + memory
  */
 
 /* Start a new transcript. 0 on success. */
 int session_open(chat *c);
 
-/* Continue an existing transcript (appends to it). 0 on success. */
+/* Continue an existing transcript (appends to it). Returns restored message
+ * count, or -1 (errno=EBUSY if another process owns it). Locked until close. */
 int session_resume(const char *path, chat *c);
 
 /* Most recent transcript in ./.lambda/chats; 0 if found. */
@@ -30,6 +33,10 @@ int session_find_last(char *out, size_t cap);
 /* Bring the log in line with chat history — appends newly committed messages
  * and records rollbacks. Cheap; call after every history change. */
 void session_sync(chat *c);
+/* Atomically replace a prefix with chat_summary(c), retaining an optional
+ * pinned message from that prefix and the untouched tail. Originals stay on disk. */
+void session_compact(chat *c, int drop, int pin);
+void session_clear(void);
 
 void session_meta(const char *key, const char *value);
 

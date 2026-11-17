@@ -6,11 +6,111 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
 
 static jsmntok_t g_toks[LAMBDA_JSON_TOKENS];
 
+/* jsmn tokenises but accepts missing commas, invalid primitives and multiple
+ * roots. Check grammar first: tool arguments must never be partly executed. */
+static void json_space(const char **p, const char *end)
+{
+    while (*p < end && (**p == ' ' || **p == '\n' || **p == '\r' || **p == '\t'))
+        (*p)++;
+}
+
+static int json_string(const char **p, const char *end)
+{
+    if (*p == end || *(*p)++ != '"')
+        return -1;
+    while (*p < end) {
+        unsigned char ch = (unsigned char)*(*p)++;
+        if (ch == '"')
+            return 0;
+        if (ch < 0x20)
+            return -1;
+        if (ch == '\\') {
+            if (*p == end)
+                return -1;
+            ch = (unsigned char)*(*p)++;
+            if (ch == 'u') {
+                for (int i = 0; i < 4; i++) {
+                    if (*p == end)
+                        return -1;
+                    ch = (unsigned char)*(*p)++;
+                    if (!((ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f') ||
+                          (ch >= 'A' && ch <= 'F')))
+                        return -1;
+                }
+            } else if (!strchr("\"\\/bfnrt", ch) || ch == 0)
+                return -1;
+        }
+    }
+    return -1;
+}
+
+static int json_value(const char **p, const char *end, int depth)
+{
+    json_space(p, end);
+    if (*p == end || depth > 64)
+        return -1;
+    char ch = **p;
+    if (ch == '"')
+        return json_string(p, end);
+    if (ch == '{' || ch == '[') {
+        char close = ch == '{' ? '}' : ']';
+        (*p)++;
+        json_space(p, end);
+        if (*p < end && **p == close) { (*p)++; return 0; }
+        for (;;) {
+            if (ch == '{') {
+                if (json_string(p, end) != 0) return -1;
+                json_space(p, end);
+                if (*p == end || *(*p)++ != ':') return -1;
+            }
+            if (json_value(p, end, depth + 1) != 0) return -1;
+            json_space(p, end);
+            if (*p == end) return -1;
+            if (**p == close) { (*p)++; return 0; }
+            if (*(*p)++ != ',') return -1;
+            json_space(p, end);
+        }
+    }
+    const char *literal = ch == 't' ? "true" : ch == 'f' ? "false" : ch == 'n' ? "null" : NULL;
+    if (literal) {
+        size_t n = strlen(literal);
+        if ((size_t)(end - *p) < n || memcmp(*p, literal, n)) return -1;
+        *p += n;
+        return 0;
+    }
+    if (**p == '-') (*p)++;
+    if (*p == end) return -1;
+    if (**p == '0') (*p)++;
+    else {
+        if (**p < '1' || **p > '9') return -1;
+        do { (*p)++; } while (*p < end && **p >= '0' && **p <= '9');
+    }
+    if (*p < end && **p == '.') {
+        (*p)++;
+        if (*p == end || **p < '0' || **p > '9') return -1;
+        do { (*p)++; } while (*p < end && **p >= '0' && **p <= '9');
+    }
+    if (*p < end && (**p == 'e' || **p == 'E')) {
+        (*p)++;
+        if (*p < end && (**p == '+' || **p == '-')) (*p)++;
+        if (*p == end || **p < '0' || **p > '9') return -1;
+        do { (*p)++; } while (*p < end && **p >= '0' && **p <= '9');
+    }
+    return 0;
+}
+
 int jdoc_parse(jdoc *d, const char *js, size_t len)
 {
+    const char *end = js + len, *cursor = js;
+    if (json_value(&cursor, end, 0) != 0)
+        return -1;
+    json_space(&cursor, end);
+    if (cursor != end)
+        return -1;
     jsmn_parser p;
     jsmn_init(&p);
     int n = jsmn_parse(&p, js, len, g_toks, LAMBDA_JSON_TOKENS);
@@ -78,6 +178,8 @@ static unsigned read_hex4(const char *s, unsigned *cp)
 static void put_utf8(buf *out, unsigned cp)
 {
     char u[4];
+    if ((cp >= 0xd800 && cp <= 0xdfff) || cp > 0x10ffff)
+        cp = 0xfffd;
     if (cp < 0x80) {
         u[0] = (char)cp;
         buf_append(out, u, 1);
@@ -153,12 +255,38 @@ int j_str(const jdoc *d, int obj, const char *name, buf *out)
     return j_str_tok(d, j_get(d, obj, name), out);
 }
 
+int j_copy_json(buf *out, const char *js, size_t len)
+{
+    jdoc d;
+    if (jdoc_parse(&d, js, len) != 0)
+        return -1;
+    static char decoded[LAMBDA_MSG_MAX];
+    buf value;
+    buf_attach(&value, decoded, sizeof decoded);
+    size_t pos = 0;
+    for (int i = 0; i < d.n; i++) {
+        if (d.toks[i].type != JSMN_STRING)
+            continue;
+        size_t start = (size_t)d.toks[i].start - 1;
+        buf_append(out, js + pos, start - pos);
+        if (j_str_tok(&d, i, &value) != 0 || value.overflow)
+            return -1;
+        buf_append_json_bytes(out, value.data, value.len);
+        pos = (size_t)d.toks[i].end + 1;
+    }
+    buf_append(out, js + pos, len - pos);
+    return out->overflow ? -1 : 0;
+}
+
 long j_long(const jdoc *d, int obj, const char *name, long dflt)
 {
     int ix = j_get(d, obj, name);
     if (ix < 0 || d->toks[ix].type != JSMN_PRIMITIVE)
         return dflt;
-    return strtol(d->js + d->toks[ix].start, NULL, 10);
+    char *end;
+    errno = 0;
+    long n = strtol(d->js + d->toks[ix].start, &end, 10);
+    return errno == ERANGE || end != d->js + d->toks[ix].end ? dflt : n;
 }
 
 int j_raw(const jdoc *d, int ix, const char **p, size_t *len)

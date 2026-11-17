@@ -18,6 +18,10 @@ int ui_is_tty(void);
 void ui_init(const char *model); /* enters fullscreen tui if on a tty */
 void ui_shutdown(void);
 void ui_set_model(const char *model);
+/* Optional live-output consumer. tick returns 1 while background work needs
+ * polling; cancel runs on ctrl-c. Restored/history text never calls text. */
+void ui_set_output_hooks(void (*text)(const char *), int (*tick)(void),
+                         void (*cancel)(void));
 
 /* completed transcript items */
 void ui_add(int kind, const char *text);
@@ -40,12 +44,15 @@ int ui_pump(void);
 /* Take the oldest queued prompt, if any. 1 on success. */
 int ui_take_queued(char *out, size_t cap);
 int ui_queued_count(void);
+/* Keep queued prompts after a failed/cancelled turn; empty Enter resumes. */
+void ui_pause_queued(void);
 
 /* right-hand indicators in the top border ("" clears) */
 void ui_badge(const char *text);
 
-/* Modal list over the transcript: up/down or 1-9 to move, enter to choose,
- * esc to cancel. `notes[i]` is optional trailing detail and may be NULL, as
+/* Modal list: type to filter, arrows/page keys to move, enter to choose,
+ * esc to cancel. Unfiltered lists of <=9 items also accept digit shortcuts.
+ * `notes[i]` is optional trailing detail and may be NULL, as
  * may `notes` itself. Returns the chosen index, or -1 if cancelled or if
  * there is no tui. */
 int ui_pick(const char *title, const char *const *items,

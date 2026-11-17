@@ -21,18 +21,18 @@
 typedef struct {
     const char *p;
     int len;
-    const unsigned char *f;
+    const md_flags *f;
     int flen; /* bytes of `f` that are valid; past it, flags are 0 */
 } cell;
 
-static unsigned char g_cf[TABLE_MAX_COLS][CELL_FLAGS_MAX];
+static md_flags g_cf[TABLE_MAX_COLS][CELL_FLAGS_MAX];
 static char g_row[ROW_MAX];
-static unsigned char g_rowf[ROW_MAX];
+static md_flags g_rowf[ROW_MAX];
 static int g_rn;
 
 static int is_space(char c) { return c == ' ' || c == '\t'; }
 
-static unsigned char cflag(const cell *c, int i)
+static md_flags cflag(const cell *c, int i)
 {
     return i < c->flen ? c->f[i] : 0;
 }
@@ -166,7 +166,7 @@ static int seg_end(const cell *c, int off, int w, int *next, int *width)
     int i = off, col = 0, last_space = -1, space_col = 0;
     while (i < c->len) {
         int at = i;
-        unsigned char f = cflag(c, i);
+        md_flags f = cflag(c, i);
         uint32_t cp = utf8_cp(c->p, c->len, &i);
         if (f & MD_HIDE)
             continue; /* a marker takes no column */
@@ -202,7 +202,7 @@ static int cell_width(const cell *c)
 {
     int i = 0, col = 0;
     while (i < c->len) {
-        unsigned char f = cflag(c, i);
+        md_flags f = cflag(c, i);
         uint32_t cp = utf8_cp(c->p, c->len, &i);
         if (!(f & MD_HIDE))
             col += term_char_width(cp);
@@ -211,7 +211,7 @@ static int cell_width(const cell *c)
 }
 
 /* ---- row assembly ------------------------------------------------------ */
-static void put_cp(uint32_t cp, unsigned char fl)
+static void put_cp(uint32_t cp, md_flags fl)
 {
     char u[4];
     int n = 0;
@@ -233,11 +233,11 @@ static void put_cp(uint32_t cp, unsigned char fl)
     }
 }
 
-static void put_seg(const cell *c, int s, int e, unsigned char extra)
+static void put_seg(const cell *c, int s, int e, md_flags extra)
 {
     for (int i = s; i < e && g_rn < ROW_MAX; i++) {
         g_row[g_rn] = c->p[i];
-        g_rowf[g_rn++] = (unsigned char)(cflag(c, i) | extra);
+        g_rowf[g_rn++] = (md_flags)(cflag(c, i) | extra);
     }
 }
 
@@ -256,7 +256,7 @@ static void emit_border(const int *w, int nc, uint32_t l, uint32_t mid,
 
 /* one logical row, wrapped across as many screen rows as its cells need */
 static void emit_row(cell *cells, int nc, const int *w, const int *align,
-                     unsigned char extra, table_row_fn emit, void *ud)
+                     md_flags extra, table_row_fn emit, void *ud)
 {
     int off[TABLE_MAX_COLS];
     for (int c = 0; c < nc; c++)

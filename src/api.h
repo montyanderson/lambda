@@ -13,13 +13,24 @@ void chat_init(chat *c);
 void chat_clear(chat *c); /* drop conversation history */
 
 const char *chat_model(const chat *c);
-void chat_set_model(chat *c, const char *model);
+/* Reject empty or oversized ids instead of silently selecting another model. */
+int chat_set_model(chat *c, const char *model);
+void chat_set_max_tokens(chat *c, int n);
+void chat_set_context_window(chat *c, long tokens); /* 0 = model metadata */
+long chat_context_window(chat *c);
+long chat_context_tokens(chat *c); /* conservative estimate + observed usage */
+long chat_context_threshold(chat *c);
+const char *chat_summary(const chat *c);
+int chat_set_summary(chat *c, const char *text);
+/* Summarise older history; 1 compacted, 0 nothing to compact, -1 failed. */
+int chat_compact(chat *c, char *err, size_t errsz);
 
 /* Models offered by /model. Any other id can still be set by hand — this is
  * the shortlist the picker shows, not a whitelist. */
 typedef struct {
     const char *id;
     const char *note; /* context window · price per mtok */
+    long context_tokens, output_tokens; /* 0 when unknown */
 } model_info;
 
 int chat_model_count(void);

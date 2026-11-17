@@ -15,6 +15,7 @@
 #define TATTR_DIM 0x02
 #define TATTR_ITALIC 0x04
 #define TATTR_REVERSE 0x08
+#define TATTR_UNDERLINE 0x10
 
 /* key event types */
 enum {

@@ -9,6 +9,8 @@ extremely fast portable agent harness in c.
 * minimal dynamic memory allocation
 * single-file c plugins (exa web search included)
 * every chat saved as resumable ndjson
+* optional streaming voice output through Inworld TTS
+* native herdr state reporting and session restore
 
 ## build
 
@@ -19,6 +21,9 @@ make install    # → $(PREFIX)/bin, default /usr/local
 make uninstall
 make test       # unit tests under asan/ubsan
 make uitest     # terminal render + scroll checks (needs python + pyte)
+make apitest    # LiteLLM protocol + picker checks (python stdlib, local socket)
+make contexttest # automatic summaries, context recovery, resume (python stdlib)
+make herdrtest   # herdr lifecycle + resume checks (python stdlib, local sockets)
 make STATIC=1   # static binary (best with musl-gcc)
 make DEBUG=1    # asan/ubsan
 ```
@@ -42,31 +47,217 @@ lambda resume FILE          # continue a specific one
 | flag | |
 |---|---|
 | `-m MODEL` | model id (default `claude-fable-5`) |
+| `--litellm URL` | use a LiteLLM proxy; accepts http/https and an optional `/v1` suffix |
+| `--anthropic` | use Anthropic directly, ignoring saved LiteLLM config |
+| `--models` | print available model ids and exit |
+| `--max-tokens N` | output limit (4096 through LiteLLM, 64000 direct) |
+| `--context-window N` | override automatic context-window detection |
 | `-s SYSTEM` | system prompt |
 | `-p PROMPT` | one-shot, then exit |
 | `-e EFFORT` | `low`…`max` reasoning effort |
 | `-r FILE` / `-c` | same as `resume FILE` / `resume` |
 | `--no-thinking` | hide reasoning |
+| `--voice` | speak replies through a local audio player |
+| `--voice-id ID` | override the Inworld voice for this run |
 | `--no-tools` | disable bash |
 | `--no-log` | don't record |
 | `--no-context` | ignore `AGENTS.md` / `CLAUDE.md` |
 | `--no-fallback` | disable refusal fallbacks |
 
-commands: `/model`, `/system`, `/effort`, `/thinking`, `/tools`, `/clear`,
+commands: `/model`, `/models`, `/context`, `/compact`, `/system`, `/effort`, `/thinking`, `/voice`, `/tools`, `/clear`,
 `/help`, `/quit`.
 
-bare `/model` opens a picker over the transcript — up/down or `1`-`9` to move,
-enter to switch, esc to cancel. `/model ID` sets any id directly, whether or
-not it is on the list.
+bare `/model` opens a picker over the transcript — type to filter, arrows or
+page keys to move, enter to switch, esc to cancel. ctrl-u clears the filter.
+lists of nine or fewer models also accept `1`–`9` as selection shortcuts.
+`/model ID` sets any id directly, whether or not it is on the list.
 
-keys: enter sends. pgup/pgdn or wheel scroll. ctrl-c interrupts a reply or a
+keys: enter sends. pgup/pgdn scroll. ctrl-c interrupts a reply or a
 running command. ctrl-d quits. ctrl-a/e/k/u/w edit, up/down for history.
+
+drag to select text and use your terminal's copy/paste shortcuts. bracketed
+paste keeps multiline text in the input until you press enter. mouse capture
+is off by default; `LAMBDA_MOUSE=1 lambda` enables wheel scrolling, with
+shift-drag selection in terminals that support it.
 
 the input stays live while the model works — enter queues instead of
 interrupting. queued prompts show above the input marked `»` and run in order.
+after an error or ctrl-c, queued prompts pause. press enter with empty input
+to resume them. a full queue keeps the unsent draft in the editor.
 
 piped or redirected it drops the tui and streams plain text to stdout.
 `NO_COLOR` disables styling there.
+
+## herdr
+
+run `lambda` in a [herdr](https://herdr.dev/tui/docs/add-herdr-support/) pane.
+it reports its name and state automatically; no plugin or wrapper is needed.
+
+* `idle`: ready for input.
+* `working`: generating a reply, running tools, compacting or fetching models.
+* `blocked`: selecting a model, a failed turn, or queued prompts paused after
+  an error or interrupt. the report includes a short explanation.
+
+quitting releases the pane. cancelling a turn without queued prompts returns
+to idle; successful queued turns stay working until the queue is drained.
+
+with herdr 0.9.2 or later, recorded sessions also report a resume command.
+after a herdr restart, it runs `lambda -r /absolute/path/to/transcript` with
+the current model, reasoning effort, provider, tool and display settings,
+voice settings, and explicit token/context limits. system prompts stay in the
+transcript. install `lambda` on `PATH` (`make install`) so herdr can launch it.
+credentials continue to come from lambda's environment or config file.
+
+`--no-log` sessions cannot restore. if a resume argument contains an apostrophe
+or control character, or the command exceeds herdr's 8 kib limit, lambda omits
+the resume command and continues reporting state.
+
+the integration activates only with `HERDR_ENV=1` and nonempty
+`HERDR_PANE_ID`, `HERDR_BIN_PATH` and `HERDR_SOCKET_PATH`. it uses herdr's
+documented Unix socket API with static buffers, no helper process or thread,
+and a 50 ms total timeout per report. failures are silent; the next state
+change tries again. outside herdr it does nothing.
+
+verified with herdr 0.9.5 on linux: native state detection, a server restart
+that restored the same transcript and prior messages, and release on quit.
+the check used an isolated herdr session and a local model fixture.
+
+## voice output
+
+install a streaming MP3 player on the machine running lambda. macOS:
+
+```sh
+brew install mpv
+export INWORLD_VOICE_ID=sparkly-palm-9744__alan_bennett_1
+lambda --voice
+```
+
+set `INWORLD_API_KEY` in that machine's environment or secret manager first.
+create a key in the [Inworld Portal](https://platform.inworld.ai) if needed.
+lambda sends it unchanged as `Authorization: Basic <key>`. it is never
+written to settings, transcripts, player arguments, or error messages, and
+is removed from the audio player's environment.
+
+`/voice` toggles speech; `/voice on`, `/voice off`, and `/voice stop` are
+also accepted. stop cancels current playback while keeping voice enabled
+for the next reply. ctrl-c stops speech immediately, including after text
+has finished. a new prompt cancels any previous audio. one-shot mode waits
+for playback before exiting. text output stays available if synthesis fails.
+
+the voice can also be saved in `~/.config/lambda/voice.json` (or
+`$XDG_CONFIG_HOME/lambda/voice.json`):
+
+```json
+{"voice_id": "sparkly-palm-9744__alan_bennett_1"}
+```
+
+`--voice-id` overrides `INWORLD_VOICE_ID`, which overrides the saved voice.
+with no voice configured, the default is Sarah. synthesis uses `inworld-tts-2`,
+MP3, speaking rate 1, `BALANCED` delivery and `AUTO` language.
+
+speech starts while text is still arriving. complete sentences and newlines
+flush immediately; shorter unfinished phrases buffer for at most 400 ms,
+even while text keeps arriving. long phrases split at whitespace or a complete UTF-8 character, up to
+1,200 bytes per request. each request uses Inworld's
+[HTTP streaming endpoint](https://docs.inworld.ai/api-reference/ttsAPI/texttospeech/synthesize-speech-stream.md);
+audio chunks are decoded and played as they arrive. only live assistant text
+is spoken, including its markdown; reasoning, tool output, internal memory
+summaries and restored history are excluded.
+
+playback uses the first available player in this order: `mpv`, `mpg123`,
+`ffplay`. it runs in a separate process so typing and model output stay
+responsive. pending text is bounded to 1 MiB; exceeding that stops speech
+for the reply and reports an error. audio stays in pipes and memory.
+over SSH, sound plays on the remote host. run lambda locally on your Mac
+to hear it there. voice mode is opt-in and is not restored from transcripts.
+
+## litellm
+
+save your proxy URL and a virtual key in `~/.config/lambda/config.json`
+(or `$XDG_CONFIG_HOME/lambda/config.json`):
+
+```json
+{
+  "base_url": "http://localhost:4000",
+  "api_key": "sk-your-lambda-virtual-key"
+}
+```
+
+keep this file private (`chmod 600 ~/.config/lambda/config.json`). lambda
+loads it automatically. credentials stay out of transcripts.
+
+environment variables override the saved settings:
+
+```sh
+export LITELLM_BASE_URL=http://localhost:4000
+export LITELLM_API_KEY=sk-your-lambda-virtual-key
+
+lambda                        # fetch models and open the picker
+lambda --models               # print the catalog
+lambda -m local/qwen3.8-27b -p "hello"
+lambda --anthropic            # use the direct Anthropic connection
+```
+
+`LITELLM_PROXY_URL` is an alias for `LITELLM_BASE_URL`. `--litellm URL`
+overrides the URL for one run. an empty `LITELLM_API_KEY` disables proxy
+authentication; Anthropic credentials are never sent to LiteLLM.
+
+lambda fetches `/v1/models`, sorts and deduplicates the ids, and shows the
+full returned list with a search filter. `/models` refreshes the catalog;
+`/model` refreshes and opens the picker. a failed refresh keeps the last good
+list. the fixed catalog holds up to 1024 models; larger lists fail explicitly.
+the proxy may list image, embedding, or retired models: choose a model that
+supports chat (and tool calling when using tools).
+
+an explicit `-m` or resumed model skips startup discovery. one-shot mode
+requires `-m` when the proxy offers more than one model. model selection is
+recorded in the transcript and restored on resume.
+
+chat uses LiteLLM's [unified messages endpoint](https://docs.litellm.ai/docs/anthropic_unified/),
+which translates streaming replies and tool calls across providers. switching
+models keeps text and tool history, dropping thinking signatures from other
+models. overlapping text, thinking and tool blocks are tracked by their stream
+indexes so an answer cannot be saved as reasoning. direct Anthropic fallback and adaptive-thinking options are omitted
+for the proxy; reasoning settings can be configured on LiteLLM. `/thinking`
+still controls whether returned reasoning is shown. `--max-tokens` adjusts the
+proxy's 4096-token default output limit.
+
+## automatic conversation memory
+
+long chats compact automatically, including during tool loops. lambda checks
+before each request and summarises older work at the earlier of:
+
+* 80% of the model's context window;
+* the context window minus the reply allowance and a tool/safety reserve of
+  12.5% of the window, capped at 8192 tokens.
+
+LiteLLM's model metadata supplies context and output limits. the direct
+Anthropic shortlist has built-in limits. unknown models use a conservative
+32k window; `--context-window N` overrides it. the output allowance also stays
+within the model's output limit and half its context window.
+
+usage includes cached input tokens. local estimates account for system
+instructions, project files, tool definitions, memory and messages; near the
+threshold, lambda uses the provider's token-count endpoint when available.
+if the provider still rejects a request for length, lambda reduces its working
+limit, compacts and retries automatically.
+
+the selected model writes a concise handoff of goals, constraints, decisions,
+files, completed work, tool findings and next steps. recent messages and the
+active user request stay verbatim when they fit. tool calls and results stay
+paired. oversized histories are summarised in chunks, so switching to a smaller
+model works too. summaries run without tools and only show a brief status while
+the normal reply waits.
+
+the complete original transcript stays on disk. a single `compact` record
+commits the new memory and surviving messages; resume restores that state.
+failed, interrupted or incomplete summaries leave the original history intact.
+if a summary temporarily fails while there is still headroom, the normal request
+continues. the fixed history buffers compact before filling as well.
+
+`/context` shows estimated usage and the current threshold. `/compact` updates
+memory immediately. `/clear` removes both messages and memory from the active
+conversation. no manual context management is needed for normal long chats.
 
 ## model
 
@@ -103,6 +294,10 @@ line notes the switch. `--no-fallback` disables.
 headings, `**bold**`, `*italic*`, `` `code` ``, fenced blocks, bullets and
 quotes are styled a line at a time as the reply streams.
 
+inline links render as underlined `label (url)`, keeping the destination
+visible for copying. list continuations align with their text, and formatting
+and URL punctuation survive line wrapping.
+
 tables are the exception: column widths depend on every row, so a whole
 github-style table is laid out once the delimiter row arrives, then drawn
 with box rules.
@@ -133,15 +328,24 @@ chat happens:
 {"t":"msg","m":{"role":"user","content":"…"}}
 {"t":"drop","n":1}
 {"t":"meta","k":"model","v":"claude-opus-5"}
+{"t":"compact","drop":40,"pin":-1,"summary":"goal, completed work, next steps…"}
+{"t":"clear"}
 ```
 
 `msg` holds the api message verbatim — text, thinking blocks with signatures,
-`tool_use`, `tool_result` — so a resume is byte-identical to what the model
-saw. a failed or interrupted turn rolls back and writes `drop`, so resume
-never replays a turn that didn't happen.
+`tool_use`, `tool_result`. completed reasoning stays with its original model.
+reasoning-only replies are rejected without changing history; older saved
+reasoning-only messages are skipped when building requests. a failed or
+interrupted turn rolls back and writes `drop`.
+
+concurrent starts atomically claim separate transcript files. a resumed
+transcript is locked for the lifetime of its writer; a second process gets
+a clear error instead of appending to the same history. close the first
+process before resuming that transcript elsewhere.
 
 writes are queued in memory and flushed only when idle, so they never block
-the ui or a request. survives `kill -9`.
+the ui or a request. flushed records survive `kill -9`; buffered records may
+not. transcript locks are released when the process exits or is killed.
 
 ## bash tool
 
@@ -196,7 +400,50 @@ measured, not assumed: under an `LD_PRELOAD` interposer, a full session
 attributes zero allocations to lambda. the ~500 the process makes are glibc's,
 from `getaddrinfo` and stdio. `objdump -R` shows no allocator import.
 
-bss is ~22 mb of arenas but demand-paged, so startup stays ~1 ms.
+bss is ~72.3 mib of arenas in the measured build below. these are demand-paged;
+reserved address space does not all become resident memory at startup.
+
+## memory comparison
+
+measured on travis, linux x86-64, 2026-11-17: lambda 0.7.0 (the normal `make`
+build, dynamically linked) and codex-cli 0.169.0. one fresh terminal session
+each, running together in this repo with 120×40 terminals and local settings.
+
+| measurement | lambda rss | codex rss | lambda pss | codex pss |
+|---|---:|---:|---:|---:|
+| idle before prompt, median | 28.1 mib | 281.8 mib | 26.5 mib | 195.7 mib |
+| prompt window, sampled peak | 33.5 mib | 311.0 mib | 31.2 mib | 224.2 mib |
+| idle after reply, median | 33.5 mib | 306.6 mib | 31.1 mib | 219.8 mib |
+| whole run, sampled peak | 33.5 mib | 312.4 mib | 31.2 mib | 225.6 mib |
+
+codex used 10.0× lambda's idle rss and 7.4× its idle pss in this run.
+rss counts resident pages in full; pss divides shared pages among the
+processes using them. mib means 1,048,576 bytes.
+
+commands:
+
+```sh
+./lambda -m lyber/kimi-k31-pro-abliterated
+codex --no-daemon --no-alt-screen -s read-only -a never
+```
+
+after startup, sampled idle memory for 38 seconds, sent each session
+`Without using tools, reply with exactly: memory benchmark complete`, then
+sampled for another 31 seconds after both replies finished. both returned
+the requested text without tool calls. lambda used the configured LiteLLM
+proxy; codex used `gpt-6-astra` with high reasoning effort.
+
+read `/proc/<pid>/smaps_rollup` for each process and its recursive children,
+sleeping 100 ms between scans (about 110 ms including collection). the monitor
+is excluded. `--no-daemon` keeps codex's session in the measured process;
+each tree contained one process at every sample. codex kept its configured
+integrations and reported MCP startup failures for exa and notion; exa needed
+OAuth reauthentication.
+
+this is one short session with different remote models and local configuration.
+it does not measure model-server memory, long conversations, or tool workloads;
+sampling can miss brief peaks. [measurement details](benchmarks/memory-2026-11-17.json)
+include versions, the lambda binary hash, sample counts and memory ranges.
 
 ## tls
 
@@ -212,6 +459,8 @@ src/
   main.c    args, repl, slash commands
   api.c     messages api, sse parsing, tool loop
   http.c    https client on bearssl + picohttpparser
+  gateway.c LiteLLM config, URL routing, virtual-key auth, model discovery
+  herdr.c   native pane state, transcript resume command, bounded local IPC
   ta.c      pem bundle → bearssl trust anchors
   tools.c   bash tool + dispatch
   plugin.c  plugin registry, shared https helper
@@ -239,6 +488,8 @@ arrays it reallocs. raw mode + diffed grid + key decoding is ~450 lines.
 `make test` builds `tests/` under asan and ubsan with a deliberately tiny
 transcript arena, so compaction and eviction are exercised in a short run
 rather than only after hours of use.
+it also checks JSON/Unicode encoding, search excerpt boundaries, every split
+point in HTTP and SSE fixtures, randomized stream chunks, and queue invariants.
 
 `make uitest` covers the two display bugs that have actually shipped. it
 replays term.c's own escape output through an independent terminal emulator
@@ -251,6 +502,41 @@ with no api key.
 
 ci compiles with `-Werror` on gcc and clang across linux and macos, runs both
 suites, and checks the static link.
+
+`make apitest` runs the real binary against a local HTTP fixture. it checks
+configuration precedence, credential isolation, catalogs larger than the old
+picker limit, malformed responses, fragmented streams, a bash tool round trip,
+resume after switching providers, failed-turn rollback, and TUI filtering.
+it also checks recovery from incomplete reasoning and fragmented multiline paste.
+
+`make sessiontest` checks concurrent starts, exclusive resume (including
+alternate paths), and lock release on normal exit and process termination.
+
+`make reliabilitytest` injects binary and truncated tool output, malformed
+streams, invalid and excessive tool calls, provider errors after side effects,
+and cancellation while a child has closed its output. real TUI processes check
+FIFO queueing, capacity, and pause/resume with requests held at known points.
+completed tool results survive later errors. unfinished calls recovered after
+a process dies are marked as having unknown outcomes, so the model can inspect
+state before retrying them. these checks use a local server and run in CI.
+
+`make livetest` is an opt-in test against the configured LiteLLM service using
+the two Lyber models. it makes paid API calls: 13 prompts per model cover
+recall, file writes/reads/appends, markdown links, repeated resumes and model
+switching, binary tool output and recall afterwards; four more prompts run
+concurrent sessions in one directory. replies
+and file contents are checked automatically. a JSON report and transcripts
+are retained in the printed temporary directory. set `LAMBDA_TEST_BINARY` to
+test an installed binary instead of `./lambda`. this is not run in CI.
+
+`make contexttest` checks proactive compaction, multi-chunk summaries, repeated
+resume, provider context errors, token-count fallback, cached usage, active tool
+loops, pinned user requests, history capacity and failed-summary rollback.
+
+`make herdrtest` uses local HTTP and Unix socket fixtures to check lifecycle
+reports, changing settings, executable transcript restore, model selection,
+errors, interrupted queues, and missing or unresponsive herdr servers.
+it needs no herdr installation, provider credentials, or external network.
 
 ## limits
 

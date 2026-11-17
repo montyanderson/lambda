@@ -23,6 +23,7 @@
 #define CHATS_DIR ".lambda/chats"
 
 static int g_fd = -1;
+static FILE *g_reader; /* keep the replay fd open: closing it releases POSIX locks */
 static char g_path[LAMBDA_PATH_MAX];
 static char g_qstore[LAMBDA_SESSION_QUEUE];
 static buf g_q;
@@ -35,7 +36,11 @@ int session_enabled(void) { return g_fd >= 0; }
 void session_disable(void)
 {
     if (g_fd >= 0) {
-        close(g_fd);
+        if (g_reader)
+            fclose(g_reader);
+        else
+            close(g_fd);
+        g_reader = NULL;
         g_fd = -1;
     }
     buf_reset(&g_q);
@@ -119,11 +124,22 @@ static void now_iso(char *out, size_t cap)
     strftime(out, cap, "%Y-%m-%dT%H:%M:%SZ", &tm);
 }
 
-static int open_append(const char *path)
+static int open_append(const char *path, int create)
 {
-    int fd = open(path, O_WRONLY | O_CREAT | O_APPEND | O_NONBLOCK, 0600);
+    int flags = O_RDWR | O_APPEND | O_NONBLOCK | O_CLOEXEC;
+    int fd = open(path, flags | (create ? O_CREAT | O_EXCL : 0), 0600);
     if (fd < 0)
         return -1;
+    struct flock lock;
+    memset(&lock, 0, sizeof lock);
+    lock.l_type = F_WRLCK;
+    lock.l_whence = SEEK_SET;
+    if (fcntl(fd, F_SETLK, &lock) < 0) {
+        int error = errno == EACCES || errno == EAGAIN ? EBUSY : errno;
+        close(fd);
+        errno = error;
+        return -1;
+    }
     g_fd = fd;
     snprintf(g_path, sizeof g_path, "%s", path);
     buf_attach(&g_q, g_qstore, sizeof g_qstore);
@@ -138,12 +154,12 @@ int session_open(chat *c)
     char stamp[64], path[LAMBDA_PATH_MAX];
     now_stamp(stamp, sizeof stamp);
     snprintf(path, sizeof path, "%s/%s.jsonl", CHATS_DIR, stamp);
-    /* if that name exists (same second), fall back to a suffix */
-    for (int i = 1; access(path, F_OK) == 0 && i < 100; i++)
-        snprintf(path, sizeof path, "%s/%s-%d.jsonl", CHATS_DIR, stamp, i);
-
-    if (open_append(path) != 0)
-        return -1;
+    /* Claim the filename atomically; concurrent starts never append together. */
+    for (int i = 1; open_append(path, 1) != 0; i++) {
+        if (errno != EEXIST || i >= 10000)
+            return -1;
+        snprintf(path, sizeof path, "%s/%s-%04d.jsonl", CHATS_DIR, stamp, i);
+    }
 
     char iso[64], cwd[LAMBDA_PATH_MAX];
     now_iso(iso, sizeof iso);
@@ -214,13 +230,31 @@ void session_sync(chat *c)
     }
 }
 
+void session_compact(chat *c, int drop, int pin)
+{
+    if (g_fd < 0)
+        return;
+    static char rec[LAMBDA_SUMMARY_MAX * 6 + 128];
+    buf b;
+    buf_attach(&b, rec, sizeof rec);
+    buf_appendf(&b, "{\"t\":\"compact\",\"drop\":%d,\"pin\":%d,\"summary\":", drop, pin);
+    buf_append_json_str(&b, chat_summary(c));
+    buf_appends(&b, "}");
+    queue(b.data, b.len);
+    g_logged = chat_msg_count(c);
+    session_flush(); /* one complete record is the compaction commit */
+}
+
+void session_clear(void)
+{
+    queue("{\"t\":\"clear\"}", strlen("{\"t\":\"clear\"}"));
+    g_logged = 0;
+}
+
 void session_close(void)
 {
     session_flush();
-    if (g_fd >= 0) {
-        close(g_fd);
-        g_fd = -1;
-    }
+    session_disable();
 }
 
 /* ---- resume ------------------------------------------------------------- */
@@ -264,6 +298,7 @@ static void replay_ui(const char *json, size_t len)
 
 static char g_line[LAMBDA_MSG_MAX + 1024];
 static long g_offs[LAMBDA_MAX_MSGS]; /* file offset of each surviving msg */
+static char g_producers[LAMBDA_MAX_MSGS][LAMBDA_MODEL_ID_MAX];
 
 /* strip the trailing newline; returns the remaining length */
 static size_t chomp(char *s)
@@ -276,9 +311,19 @@ static size_t chomp(char *s)
 
 int session_resume(const char *path, chat *c)
 {
-    FILE *f = fopen(path, "rb");
-    if (!f)
+    /* Take ownership before reading, so replay and subsequent appends see
+     * one stable history. Keep this same descriptor locked until close. */
+    if (open_append(path, 0) != 0)
         return -1;
+    FILE *f = fdopen(g_fd, "r");
+    if (!f) {
+        int error = errno;
+        session_disable();
+        errno = error;
+        return -1;
+    }
+    g_reader = f;
+    chat_clear(c);
 
     /* Pass 1: note where each message lives, honouring `drop` records so
      * rolled-back exchanges are not resurrected. */
@@ -296,8 +341,31 @@ int session_resume(const char *path, chat *c)
         int t = j_get(&d, 0, "t");
 
         if (j_is(&d, t, "msg")) {
-            if (nlive < LAMBDA_MAX_MSGS)
+            if (nlive < LAMBDA_MAX_MSGS) {
+                snprintf(g_producers[nlive], sizeof g_producers[nlive], "%s", chat_model(c));
                 g_offs[nlive++] = off;
+            }
+        } else if (j_is(&d, t, "clear")) {
+            nlive = 0;
+            chat_set_summary(c, "");
+        } else if (j_is(&d, t, "compact")) {
+            long drop = j_long(&d, 0, "drop", -1), pin = j_long(&d, 0, "pin", -1);
+            static char text[LAMBDA_SUMMARY_MAX];
+            buf summary;
+            buf_attach(&summary, text, sizeof text);
+            if (drop < 0 || drop > nlive || pin < -1 || pin >= drop ||
+                j_str(&d, 0, "summary", &summary) != 0 || summary.overflow)
+                continue;
+            int keep = pin >= 0 ? 1 : 0;
+            if (keep) {
+                g_offs[0] = g_offs[pin];
+                memmove(g_producers[0], g_producers[pin], LAMBDA_MODEL_ID_MAX);
+            }
+            memmove(g_offs + keep, g_offs + drop, (size_t)(nlive - drop) * sizeof g_offs[0]);
+            memmove(g_producers + keep, g_producers + drop,
+                    (size_t)(nlive - drop) * sizeof g_producers[0]);
+            nlive = nlive - (int)drop + keep;
+            chat_set_summary(c, summary.data);
         } else if (j_is(&d, t, "drop")) {
             long n = j_long(&d, 0, "n", 0);
             nlive -= (int)n;
@@ -323,6 +391,8 @@ int session_resume(const char *path, chat *c)
     }
 
     /* Pass 2: restore the survivors, in order. */
+    char final_model[LAMBDA_MODEL_ID_MAX];
+    snprintf(final_model, sizeof final_model, "%s", chat_model(c));
     int restored = 0;
     for (int i = 0; i < nlive; i++) {
         if (fseek(f, g_offs[i], SEEK_SET) != 0)
@@ -337,15 +407,23 @@ int session_resume(const char *path, chat *c)
         size_t mlen;
         if (j_raw(&d, j_get(&d, 0, "m"), &m, &mlen) != 0)
             continue;
+        chat_set_model(c, g_producers[i]);
         if (chat_push_raw(c, m, mlen) == 0) {
             replay_ui(m, mlen);
             restored++;
         }
     }
-    fclose(f);
-
-    if (open_append(path) != 0)
-        return -1;
+    chat_set_model(c, final_model);
+    /* A kill during an append can leave half a checkpoint at EOF. Separate
+     * it from future records so it cannot swallow the next committed message. */
+    int needs_newline = 0;
+    if (fseek(f, 0, SEEK_END) == 0) {
+        long end = ftell(f);
+        if (end > 0 && fseek(f, end - 1, SEEK_SET) == 0)
+            needs_newline = fgetc(f) != '\n';
+    }
+    if (needs_newline)
+        queue("", 0);
     g_logged = chat_msg_count(c);
     return restored;
 }
@@ -356,6 +434,7 @@ int session_find_last(char *out, size_t cap)
     if (!d)
         return -1;
     char best[LAMBDA_PATH_MAX] = "";
+    struct timespec best_time = {0, 0};
     struct dirent *e;
     while ((e = readdir(d))) {
         if (e->d_name[0] == '.')
@@ -363,9 +442,23 @@ int session_find_last(char *out, size_t cap)
         size_t n = strlen(e->d_name);
         if (n < 6 || strcmp(e->d_name + n - 6, ".jsonl") != 0)
             continue;
-        /* names are ISO timestamps, so lexical order is chronological */
-        if (strcmp(e->d_name, best) > 0)
+        struct stat info;
+        if (fstatat(dirfd(d), e->d_name, &info, 0) != 0 || !S_ISREG(info.st_mode))
+            continue;
+#ifdef __APPLE__
+        struct timespec modified = info.st_mtimespec;
+#else
+        struct timespec modified = info.st_mtim;
+#endif
+        /* Same-second suffixes do not sort after the unsuffixed filename.
+         * Modification time also makes a resumed chat the latest again. */
+        if (!best[0] || modified.tv_sec > best_time.tv_sec ||
+            (modified.tv_sec == best_time.tv_sec && modified.tv_nsec > best_time.tv_nsec) ||
+            (modified.tv_sec == best_time.tv_sec && modified.tv_nsec == best_time.tv_nsec &&
+             strcmp(e->d_name, best) > 0)) {
             snprintf(best, sizeof best, "%s", e->d_name);
+            best_time = modified;
+        }
     }
     closedir(d);
     if (!best[0])

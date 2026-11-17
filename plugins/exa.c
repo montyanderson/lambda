@@ -52,21 +52,31 @@ static void exa_label(const char *args_json, char *out, size_t cap)
 static void append_squeezed(buf *out, const char *s, size_t limit)
 {
     size_t n = 0;
+    size_t left = strlen(s);
     int sp = 0;
-    for (const char *p = s; *p && n < limit; p++) {
+    for (const char *p = s; left && n < limit;) {
         if (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') {
             sp = 1;
+            p++;
+            left--;
             continue;
         }
+        size_t width = utf8_span(p, left);
+        if (!width)
+            width = 1;
+        if (width + (size_t)(sp && n) > limit - n)
+            break;
         if (sp && n) {
             buf_append(out, " ", 1);
             n++;
         }
         sp = 0;
-        buf_append(out, p, 1);
-        n++;
+        buf_append(out, p, width);
+        p += width;
+        left -= width;
+        n += width;
     }
-    if (n >= limit)
+    if (left)
         buf_appends(out, "…");
 }
 

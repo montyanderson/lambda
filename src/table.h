@@ -1,6 +1,8 @@
 #ifndef LAMBDA_TABLE_H
 #define LAMBDA_TABLE_H
 
+#include "md.h"
+
 /* GitHub-style markdown tables, pre-formatted into box-drawn rows.
  *
  * Tables cannot be styled a line at a time the way the rest of the markdown
@@ -14,7 +16,7 @@
 /* One formatted row. `text` and `flags` are the same length and are only
  * valid until the next call. */
 typedef void (*table_row_fn)(void *ud, const char *text,
-                             const unsigned char *flags, int len);
+                             const md_flags *flags, int len);
 
 /* If `src` starts a table (a row of cells, then a |---|:--:| delimiter),
  * lay it out to fit `maxcols` columns, emit its rows through `emit`, and

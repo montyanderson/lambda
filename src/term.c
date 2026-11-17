@@ -8,6 +8,7 @@
 #include <stdarg.h>
 #include <signal.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/select.h>
@@ -177,7 +178,13 @@ int term_init(void)
     update_size();
     outs("\x1b[?1049h"); /* alternate screen */
     outs("\x1b[?25l");   /* hide cursor */
-    outs("\x1b[?1000h\x1b[?1006h"); /* mouse: button events, SGR encoding */
+    /* Native terminal selection owns the mouse by default. Opt in to wheel
+     * reporting when desired; Shift-drag then bypasses it in most terminals. */
+    outs("\x1b[?1006l\x1b[?1000l"); /* reset modes left by an interrupted process */
+    const char *mouse = getenv("LAMBDA_MOUSE");
+    if (mouse && strcmp(mouse, "1") == 0)
+        outs("\x1b[?1000h\x1b[?1006h");
+    outs("\x1b[?2004h"); /* bracketed paste: newlines are input, not Enter */
     outs("\x1b[2J");
     flush_out();
     term_clear();
@@ -191,6 +198,7 @@ void term_shutdown(void)
     if (!g_active)
         return;
     outs("\x1b[?1006l\x1b[?1000l");
+    outs("\x1b[?2004l");
     outs("\x1b[0m");
     outs("\x1b[?25h");
     outs("\x1b[?1049l"); /* leave alternate screen */
@@ -351,6 +359,8 @@ static void emit_sgr(int fg, int bg, int attr)
         outs(";2");
     if (attr & TATTR_ITALIC)
         outs(";3");
+    if (attr & TATTR_UNDERLINE)
+        outs(";4");
     if (attr & TATTR_REVERSE)
         outs(";7");
     if (fg >= 0)
@@ -452,6 +462,7 @@ void term_hide_cursor(void)
 
 static char g_in[256];
 static size_t g_inlen;
+static int g_paste, g_paste_cr;
 
 /* read more bytes; returns 0 on timeout, -1 on EOF/error, 1 on data */
 static int fill(int timeout_ms)
@@ -506,10 +517,43 @@ static term_event decode(void)
         return ev_make(K_NONE, 0);
     unsigned char c = (unsigned char)g_in[0];
 
+    if (g_paste) {
+        const char *end = "\x1b[201~";
+        size_t n = g_inlen < 6 ? g_inlen : 6;
+        if (memcmp(g_in, end, n) == 0) {
+            if (g_inlen < 6)
+                return ev_make(K_NONE, 0);
+            consume(6);
+            g_paste = g_paste_cr = 0;
+            return ev_make(K_NONE, 1);
+        }
+        if (c == '\r' || c == '\n') {
+            consume(1);
+            int skip = c == '\n' && g_paste_cr;
+            g_paste_cr = c == '\r';
+            return ev_make(skip ? K_NONE : K_CHAR, skip ? 1 : '\n');
+        }
+        g_paste_cr = 0;
+        if (c == '\t') {
+            consume(1);
+            return ev_make(K_CHAR, '\t');
+        }
+        if (c < 0x20 || c == 0x7f) {
+            consume(1);
+            return ev_make(K_NONE, 1); /* pasted control bytes aren't commands */
+        }
+    }
+
     if (c == 0x1b) {
         if (g_inlen == 1)
             return ev_make(K_NONE, 0); /* wait for the rest */
         if (g_in[1] == '[' || g_in[1] == 'O') {
+            if (g_inlen >= 6 && memcmp(g_in, "\x1b[200~", 6) == 0) {
+                consume(6);
+                g_paste = 1;
+                g_paste_cr = 0;
+                return ev_make(K_NONE, 1);
+            }
             /* CSI / SS3 */
             size_t i = 2;
             /* SGR mouse: \x1b[<b;x;yM|m */
@@ -621,7 +665,7 @@ term_event term_poll(int timeout_ms)
             continue;
 
         int r;
-        if (g_inlen == 1 && g_in[0] == 0x1b) {
+        if (!g_paste && g_inlen == 1 && g_in[0] == 0x1b) {
             long now = mono_ms();
             if (!g_esc_ms)
                 g_esc_ms = now;

@@ -48,7 +48,7 @@ static int row_cols(const char *t, int len)
     return n;
 }
 
-static void collect(void *ud, const char *text, const unsigned char *flags,
+static void collect(void *ud, const char *text, const md_flags *flags,
                     int len)
 {
     (void)ud;

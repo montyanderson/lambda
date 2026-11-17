@@ -1,0 +1,275 @@
+{
+  "date": "2026-11-17",
+  "host": "travis",
+  "os": "Linux 7.2.14-arch1-1 x86_64",
+  "libc": "glibc 2.44",
+  "lambda": {
+    "version": "0.7.0",
+    "build": "existing up-to-date make build, -O2, dynamically linked, not stripped",
+    "sha256": "6f837ff411407b9a0c814821e41c0c967f8bb17d90d1fd4ba74dcf28071aad8c",
+    "bss_bytes": 75768352,
+    "model": "lyber/kimi-k31-pro-abliterated",
+    "provider": "configured LiteLLM proxy"
+  },
+  "codex": {
+    "version": "0.169.0",
+    "model": "gpt-6-astra",
+    "reasoning_effort": "high",
+    "startup_warnings": [
+      "exa requires OAuth reauthentication",
+      "MCP startup incomplete: exa, notion"
+    ]
+  },
+  "commands": {
+    "lambda": [
+      "/home/monty/lambda/lambda",
+      "-m",
+      "lyber/kimi-k31-pro-abliterated"
+    ],
+    "codex": [
+      "codex",
+      "--no-daemon",
+      "--no-alt-screen",
+      "-s",
+      "read-only",
+      "-a",
+      "never"
+    ]
+  },
+  "cwd": "/home/monty/lambda",
+  "terminal": {
+    "columns": 120,
+    "rows": 40,
+    "TERM": "xterm-256color"
+  },
+  "prompt": "Without using tools, reply with exactly: memory benchmark complete",
+  "result": {
+    "lambda": "memory benchmark complete",
+    "codex": "memory benchmark complete",
+    "tool_calls": 0,
+    "benchmark_processes_stopped": true
+  },
+  "method": {
+    "source": "/proc/<pid>/smaps_rollup",
+    "scope": "launched process and recursive descendants; shared Codex daemon disabled; monitoring process excluded",
+    "interval": "100 ms sleep after each scan",
+    "observed_median_interval_s": 0.11,
+    "rss": "resident pages including shared mappings",
+    "pss": "resident pages with shared mappings divided among processes",
+    "uss": "Private_Clean + Private_Dirty",
+    "units": "MiB (1024 KiB)",
+    "limitations": [
+      "single pair of sessions with local configuration",
+      "different remote models and providers",
+      "sampling can miss brief peaks and short-lived children",
+      "existing shared system pages affect PSS",
+      "no long conversation or tool workload"
+    ]
+  },
+  "phases": {
+    "startup": {
+      "lambda": {
+        "samples": 158,
+        "start_s": 0.001,
+        "end_s": 16.794,
+        "all_alive": true,
+        "max_processes": 1,
+        "max_threads": 1,
+        "rss_mib": {
+          "median": 28.07,
+          "min": 5.547,
+          "max": 28.07
+        },
+        "pss_mib": {
+          "median": 26.454,
+          "min": 4.238,
+          "max": 26.454
+        },
+        "uss_mib": {
+          "median": 26.391,
+          "min": 4.184,
+          "max": 26.391
+        }
+      },
+      "codex": {
+        "samples": 158,
+        "start_s": 0.001,
+        "end_s": 16.794,
+        "all_alive": true,
+        "max_processes": 1,
+        "max_threads": 73,
+        "rss_mib": {
+          "median": 291.449,
+          "min": 1.297,
+          "max": 297.391
+        },
+        "pss_mib": {
+          "median": 205.519,
+          "min": 0.27,
+          "max": 211.46
+        },
+        "uss_mib": {
+          "median": 193.812,
+          "min": 0.16,
+          "max": 199.754
+        }
+      }
+    },
+    "idle": {
+      "lambda": {
+        "samples": 351,
+        "start_s": 16.902,
+        "end_s": 54.828,
+        "all_alive": true,
+        "max_processes": 1,
+        "max_threads": 1,
+        "rss_mib": {
+          "median": 28.07,
+          "min": 28.07,
+          "max": 28.07
+        },
+        "pss_mib": {
+          "median": 26.454,
+          "min": 26.43,
+          "max": 26.454
+        },
+        "uss_mib": {
+          "median": 26.391,
+          "min": 26.391,
+          "max": 26.391
+        }
+      },
+      "codex": {
+        "samples": 351,
+        "start_s": 16.902,
+        "end_s": 54.828,
+        "all_alive": true,
+        "max_processes": 1,
+        "max_threads": 61,
+        "rss_mib": {
+          "median": 281.766,
+          "min": 280.93,
+          "max": 284.055
+        },
+        "pss_mib": {
+          "median": 195.72,
+          "min": 194.884,
+          "max": 198.009
+        },
+        "uss_mib": {
+          "median": 184.0,
+          "min": 183.164,
+          "max": 186.289
+        }
+      }
+    },
+    "prompt": {
+      "lambda": {
+        "samples": 388,
+        "start_s": 54.939,
+        "end_s": 97.739,
+        "all_alive": true,
+        "max_processes": 1,
+        "max_threads": 1,
+        "rss_mib": {
+          "median": 29.461,
+          "min": 28.07,
+          "max": 33.461
+        },
+        "pss_mib": {
+          "median": 27.16,
+          "min": 26.454,
+          "max": 31.16
+        },
+        "uss_mib": {
+          "median": 26.863,
+          "min": 26.391,
+          "max": 30.863
+        }
+      },
+      "codex": {
+        "samples": 388,
+        "start_s": 54.939,
+        "end_s": 97.739,
+        "all_alive": true,
+        "max_processes": 1,
+        "max_threads": 63,
+        "rss_mib": {
+          "median": 306.91,
+          "min": 280.926,
+          "max": 310.961
+        },
+        "pss_mib": {
+          "median": 220.102,
+          "min": 194.88,
+          "max": 224.152
+        },
+        "uss_mib": {
+          "median": 208.281,
+          "min": 183.16,
+          "max": 212.332
+        }
+      }
+    },
+    "after_reply": {
+      "lambda": {
+        "samples": 283,
+        "start_s": 97.847,
+        "end_s": 128.82,
+        "all_alive": true,
+        "max_processes": 1,
+        "max_threads": 1,
+        "rss_mib": {
+          "median": 33.461,
+          "min": 33.461,
+          "max": 33.461
+        },
+        "pss_mib": {
+          "median": 31.147,
+          "min": 31.138,
+          "max": 31.16
+        },
+        "uss_mib": {
+          "median": 30.863,
+          "min": 30.863,
+          "max": 30.863
+        }
+      },
+      "codex": {
+        "samples": 283,
+        "start_s": 97.847,
+        "end_s": 128.82,
+        "all_alive": true,
+        "max_processes": 1,
+        "max_threads": 63,
+        "rss_mib": {
+          "median": 306.574,
+          "min": 306.496,
+          "max": 312.406
+        },
+        "pss_mib": {
+          "median": 219.767,
+          "min": 219.688,
+          "max": 225.599
+        },
+        "uss_mib": {
+          "median": 207.945,
+          "min": 207.867,
+          "max": 213.777
+        }
+      }
+    }
+  },
+  "overall_peak_mib": {
+    "lambda": {
+      "rss": 33.461,
+      "pss": 31.16,
+      "uss": 30.863
+    },
+    "codex": {
+      "rss": 312.406,
+      "pss": 225.599,
+      "uss": 213.777
+    }
+  }
+}

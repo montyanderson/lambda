@@ -73,7 +73,7 @@ def stale_frames():
         os.environ["TERM"] = "xterm-256color"
         os.environ["LAMBDA_SELFTEST_FILL"] = "150"
         os.environ.pop("ANTHROPIC_API_KEY", None)
-        os.execv(LAMBDA, ["lambda", "--no-log", "--no-context"])
+        os.execv(LAMBDA, ["lambda", "--anthropic", "--no-log", "--no-context"])
     fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", ROWS, COLS, 0, 0))
     screen = pyte.Screen(COLS, ROWS)
     stream = pyte.ByteStream(screen)
@@ -139,7 +139,7 @@ class Term:
             os.environ["TERM"] = "xterm-256color"
             os.environ.pop("ANTHROPIC_API_KEY", None)
             os.environ.update(env or {})
-            os.execv(LAMBDA, ["lambda", "--no-log", "--no-context"])
+            os.execv(LAMBDA, ["lambda", "--anthropic", "--no-log", "--no-context"])
         fcntl.ioctl(self.fd, termios.TIOCSWINSZ,
                     struct.pack("HHHH", rows, cols, 0, 0))
         self.screen = pyte.Screen(cols, rows)
@@ -248,9 +248,29 @@ def model_picker():
     t.close()
 
 
+def markdown_links():
+    print("markdown list links")
+    for cols in (100, 60, 38):
+        t = Term(30, cols, {"LAMBDA_SELFTEST_MD": "3"})
+        t.pump(0.6)
+        rows = t.rows_text()
+        body = "\n".join(rows)
+        for label in ("first link", "bold label", "nested", "[literal](url)"):
+            if label not in body:
+                fail(f"{cols} cols: missing {label!r}")
+        if "[first" in body or "**bold" in body or "](https" in body:
+            fail(f"{cols} cols: raw link/emphasis markers leaked")
+        if body.count("•") != 2:
+            fail(f"{cols} cols: list bullets missing")
+        if not any(cell.underscore for row in t.screen.buffer.values() for cell in row.values()):
+            fail(f"{cols} cols: links aren't underlined")
+        t.close()
+
+
 render_fidelity()
 stale_frames()
 markdown_tables()
+markdown_links()
 fenced_table()
 model_picker()
 print()

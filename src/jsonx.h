@@ -19,6 +19,9 @@ typedef struct {
 /* parse into a static token pool (single-threaded, one live jdoc at a time);
  * 0 on success with d->toks pointing at the pool */
 int jdoc_parse(jdoc *d, const char *js, size_t len);
+/* Validate an object and re-encode its strings as valid UTF-8 JSON. Like
+ * jdoc_parse, invalidates any earlier jdoc (the token array is shared). */
+int j_copy_json(buf *out, const char *js, size_t len);
 
 /* token index of obj's property `name`, or -1 */
 int j_get(const jdoc *d, int obj, const char *name);

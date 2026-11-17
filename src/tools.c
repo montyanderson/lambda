@@ -7,6 +7,7 @@
 #include "ui.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <signal.h>
 #include <stdio.h>
 #include <string.h>
@@ -26,6 +27,8 @@ const char *TOOL_BASH_JSON =
 
 int tool_bash(const char *command, buf *out, int (*poll)(void))
 {
+    if ((poll && poll()) || http_interrupted)
+        return 130;
     int pfd[2];
     if (pipe(pfd) != 0)
         return -1;
@@ -41,10 +44,18 @@ int tool_bash(const char *command, buf *out, int (*poll)(void))
          * shell — otherwise grandchildren keep the pipe open and we hang */
         setpgid(0, 0);
         close(pfd[0]);
+        /* Tools are noninteractive. Sharing the TUI's input descriptor lets
+         * a child consume keystrokes intended for queued prompts. */
+        int input = open("/dev/null", O_RDONLY);
+        if (input < 0 || dup2(input, STDIN_FILENO) < 0)
+            _exit(127);
+        if (input != STDIN_FILENO)
+            close(input);
         dup2(pfd[1], STDOUT_FILENO);
         dup2(pfd[1], STDERR_FILENO);
         close(pfd[1]);
         signal(SIGINT, SIG_DFL);
+        signal(SIGPIPE, SIG_DFL);
         execl("/bin/sh", "sh", "-c", command, (char *)NULL);
         _exit(127);
     }
@@ -55,6 +66,7 @@ int tool_bash(const char *command, buf *out, int (*poll)(void))
     int truncated = 0;
     int killed = 0;
     int kill_ticks = 0;
+    int pipe_open = 1, exited = 0, st = 0;
     for (;;) {
         if (poll && poll())
             http_interrupted = 1;
@@ -66,11 +78,21 @@ int tool_bash(const char *command, buf *out, int (*poll)(void))
                 kill(-pid, SIGKILL);
             }
         }
+        if (!exited) {
+            pid_t w = waitpid(pid, &st, WNOHANG);
+            if (w == pid)
+                exited = 1;
+            else if (w < 0 && errno != EINTR)
+                break;
+        }
+        if (exited && !pipe_open)
+            break;
         fd_set rf;
         struct timeval tv = {0, 120 * 1000};
-        int maxfd = pfd[0];
+        int maxfd = pipe_open ? pfd[0] : -1;
         FD_ZERO(&rf);
-        FD_SET(pfd[0], &rf);
+        if (pipe_open)
+            FD_SET(pfd[0], &rf);
         if (watch_input) { /* keep typing responsive while the command runs */
             FD_SET(STDIN_FILENO, &rf);
             if (STDIN_FILENO > maxfd)
@@ -80,12 +102,12 @@ int tool_bash(const char *command, buf *out, int (*poll)(void))
         if (r < 0) {
             if (errno == EINTR)
                 continue;
+            kill(-pid, SIGKILL);
             break;
         }
         if (r == 0)
             continue;
-        if (watch_input && FD_ISSET(STDIN_FILENO, &rf) &&
-            !FD_ISSET(pfd[0], &rf))
+        if (!pipe_open || !FD_ISSET(pfd[0], &rf))
             continue; /* poll() at the top of the loop handled it */
         char tmp[4096];
         ssize_t n = read(pfd[0], tmp, sizeof tmp);
@@ -94,15 +116,18 @@ int tool_bash(const char *command, buf *out, int (*poll)(void))
                 continue;
             break;
         }
-        if (n == 0)
-            break; /* EOF */
+        if (n == 0) {
+            close(pfd[0]);
+            pipe_open = 0;
+            continue; /* still pump/cancel a child that closed its output */
+        }
         if (!truncated && buf_append(out, tmp, (size_t)n) != 0)
             truncated = 1; /* keep draining so the child can exit */
     }
-    close(pfd[0]);
+    if (pipe_open)
+        close(pfd[0]);
 
-    int st = 0;
-    while (waitpid(pid, &st, 0) < 0 && errno == EINTR)
+    while (!exited && waitpid(pid, &st, 0) < 0 && errno == EINTR)
         ;
     if (truncated)
         out->overflow = 1;

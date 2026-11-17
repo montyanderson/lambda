@@ -74,6 +74,10 @@ static int sock_read(void *ctx, unsigned char *b, size_t len)
             if (!FD_ISSET(io->fd, &rf))
                 continue;
         }
+        if (http_interrupted) {
+            io->interrupted = 1;
+            return -1;
+        }
         ssize_t n = read(io->fd, b, len);
         if (n < 0) {
             if (errno == EINTR)
@@ -258,7 +262,7 @@ static int feed(resp *r, char *data, size_t len, char *err, size_t errsz)
 
 int http_post(const http_request *req, char *err, size_t errsz)
 {
-    if (ta_load(err, errsz) != 0)
+    if (!req->plain_http && ta_load(err, errsz) != 0)
         return HTTP_ERR;
 
     int fd = tcp_connect(req->host, req->port, err, errsz);
@@ -270,30 +274,35 @@ int http_post(const http_request *req, char *err, size_t errsz)
     br_sslio_context ioc;
     static unsigned char iobuf[BR_SSL_BUFSIZE_BIDI];
 
-    br_ssl_client_init_full(&sc, &xc, ta_anchors(), ta_count());
-    br_ssl_engine_set_buffer(&sc.eng, iobuf, sizeof iobuf, 1);
+    if (!req->plain_http) {
+        br_ssl_client_init_full(&sc, &xc, ta_anchors(), ta_count());
+        br_ssl_engine_set_buffer(&sc.eng, iobuf, sizeof iobuf, 1);
 
-    /* x509 "minimal" has no clock of its own */
-    time_t now = time(NULL);
-    br_x509_minimal_set_time(&xc, (uint32_t)(now / 86400 + 719528),
-                             (uint32_t)(now % 86400));
+        /* x509 "minimal" has no clock of its own */
+        time_t now = time(NULL);
+        br_x509_minimal_set_time(&xc, (uint32_t)(now / 86400 + 719528),
+                                 (uint32_t)(now % 86400));
 
-    br_ssl_client_reset(&sc, req->host, 0);
+        br_ssl_client_reset(&sc, req->host, 0);
+    }
 
     ioctx io = {fd, req->on_idle, req->idle_ud, req->watch_input, 0, 0};
-    br_sslio_init(&ioc, &sc.eng, sock_read, &io, sock_write, &io);
+    if (!req->plain_http)
+        br_sslio_init(&ioc, &sc.eng, sock_read, &io, sock_write, &io);
 
-    static char head_store[LAMBDA_REQ_HDRS_MAX + 1024];
+    static char head_store[LAMBDA_REQ_HDRS_MAX + 4096];
     buf head;
     buf_attach(&head, head_store, sizeof head_store);
     buf_appendf(&head,
-                "POST %s HTTP/1.1\r\n"
-                "Host: %s\r\n"
+                "%s %s HTTP/1.1\r\n"
+                "Host: %s%s%s:%s\r\n"
                 "Connection: close\r\n"
                 "Accept: application/json, text/event-stream\r\n"
                 "Content-Type: application/json\r\n"
                 "Content-Length: %zu\r\n",
-                req->path, req->host, req->body_len);
+                req->method ? req->method : "POST", req->path,
+                strchr(req->host, ':') ? "[" : "", req->host,
+                strchr(req->host, ':') ? "]" : "", req->port, req->body_len);
     if (req->extra_headers)
         buf_appends(&head, req->extra_headers);
     buf_appends(&head, "\r\n");
@@ -310,7 +319,20 @@ int http_post(const http_request *req, char *err, size_t errsz)
     r.req = req;
     buf_attach(&r.hdr, hdr_store, sizeof hdr_store);
 
-    if (br_sslio_write_all(&ioc, head.data, head.len) != 0 ||
+    if (req->plain_http) {
+        const char *parts[] = {head.data, req->body};
+        size_t lengths[] = {head.len, req->body_len};
+        for (int i = 0; i < 2; i++) {
+            size_t sent = 0;
+            while (sent < lengths[i]) {
+                int n = sock_write(&io, (const unsigned char *)parts[i] + sent,
+                                   lengths[i] - sent);
+                if (n <= 0)
+                    goto tls_fail;
+                sent += (size_t)n;
+            }
+        }
+    } else if (br_sslio_write_all(&ioc, head.data, head.len) != 0 ||
         br_sslio_write_all(&ioc, req->body, req->body_len) != 0 ||
         br_sslio_flush(&ioc) != 0) {
         goto tls_fail;
@@ -318,9 +340,11 @@ int http_post(const http_request *req, char *err, size_t errsz)
 
     for (;;) {
         unsigned char rb[8192];
-        int n = br_sslio_read(&ioc, rb, sizeof rb);
+        int n = req->plain_http ? sock_read(&io, rb, sizeof rb)
+                               : br_sslio_read(&ioc, rb, sizeof rb);
         if (n < 0) {
-            int e = br_ssl_engine_last_error(&sc.eng);
+            int e = req->plain_http ? BR_ERR_IO
+                                   : br_ssl_engine_last_error(&sc.eng);
             if (io.interrupted) {
                 ret = HTTP_INTERRUPTED;
                 goto done;
@@ -346,7 +370,7 @@ int http_post(const http_request *req, char *err, size_t errsz)
     }
 
 tls_fail: {
-    int e = br_ssl_engine_last_error(&sc.eng);
+    int e = req->plain_http ? BR_ERR_IO : br_ssl_engine_last_error(&sc.eng);
     if (io.interrupted)
         ret = HTTP_INTERRUPTED;
     else if (e == BR_ERR_X509_NOT_TRUSTED)
@@ -359,5 +383,5 @@ tls_fail: {
 }
 done:
     close(fd);
-    return ret;
+    return http_interrupted ? HTTP_INTERRUPTED : ret;
 }

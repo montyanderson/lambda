@@ -129,8 +129,11 @@ int main(void)
                                  v->p + v->len <= g_tbl + g_tbl_used;
                 if (v->len < 0 || (!inside_arena && !inside_tbl))
                     fail("wrapped line points outside both arenas", 9200);
-                if ((v->flags != NULL) != (inside_tbl != 0))
+                int styled_source = inside_arena && v->kind == UI_ASSISTANT && v->len > 0;
+                if ((v->flags != NULL) != (inside_tbl || styled_source))
                     fail("style flags do not match the line's arena", 9200);
+                if (styled_source && v->flags != g_mdf + (v->p - g_arena))
+                    fail("source style flags point at another line", 9200);
                 if (failures)
                     break;
             }
