@@ -122,6 +122,8 @@ def check():
         cfg = Path(tmp) / "lambda" / "config.json"
         cfg.parent.mkdir()
         cfg.write_text(json.dumps({"base_url": base + "/v1/", "api_key": "fixture-key"}))
+        config_before = cfg.read_bytes()
+        preference = cfg.parent / "default-model"
 
         def run(*args, code=0, extra_env=None):
             result = subprocess.run([BINARY, "--no-context", *args], env={**env, **(extra_env or {})},
@@ -246,6 +248,12 @@ def check():
         try:
             initial = drain(1)
             assert b"select model" in initial, initial[-500:]
+            assert not preference.exists()
+            os.write(fd, b"\x1b")
+            drain()
+            assert not preference.exists(), "cancelling must not save the highlighted model"
+            os.write(fd, b"/model\r")
+            drain()
             assert b"\x1b[?2004h" in initial
             assert b"\x1b[?1000h" not in initial
             assert b"\x1b[?1000l" in initial
@@ -253,6 +261,8 @@ def check():
             assert b"no matching models" in drain()
             os.write(fd, b"\x15MODEL-029\r")  # ctrl-u; case-insensitive filter
             drain()
+            assert preference.read_text() == "provider/model-029\n"
+            assert preference.stat().st_mode & 0o777 == 0o600
             state["requests"].clear()
             os.write(fd, b"hello\r")
             drain(0.5)
@@ -264,6 +274,7 @@ def check():
             os.write(fd, b"again\r")
             drain(0.5)
             assert state["requests"][-1][2]["model"] == "provider/model-299"
+            assert preference.read_text() == "provider/model-299\n"
             assert len(state["requests"][-1][2]["messages"]) == 3
             # A failed refresh must leave the last good catalog selectable.
             state["mode"] = "auth"
@@ -275,6 +286,7 @@ def check():
             os.write(fd, b"again\r")
             drain(0.5)
             assert state["requests"][-1][2]["model"] == "provider/model-111"
+            assert preference.read_text() == "provider/model-111\n"
             print("picker: startup, search, no matches, >16 entries, refresh failure, mid-chat switching: ok")
 
             state["requests"].clear()
@@ -290,6 +302,35 @@ def check():
             assert body["messages"][-1]["content"] == "first line\n\tsecond line ✓"
             assert len([body for _, _, body in state["requests"] if body is not None]) == 1
             print("clipboard: native selection enabled, fragmented multiline paste submitted once on Enter: ok")
+
+            os.write(fd, b"/model provider/model-042\r")
+            drain()
+            assert preference.read_text() == "provider/model-042\n"
+            run("--no-log", "-p", "saved default")
+            assert state["requests"][-1][2]["model"] == "provider/model-042"
+            run("--no-log", "-m", "override-model", "-p", "override")
+            assert state["requests"][-1][2]["model"] == "override-model"
+            run("--no-log", "-r", str(transcript), "-p", "resume")
+            assert state["requests"][-1][2]["model"] == "test-model"
+            assert preference.read_text() == "provider/model-042\n"
+            assert cfg.read_bytes() == config_before
+
+            child, child_fd = pty.fork()
+            if child == 0:
+                os.chdir(tmp)
+                os.execve(BINARY, [BINARY, "--no-log", "--no-context"], env)
+            try:
+                output = b""
+                end = time.monotonic() + 1
+                while time.monotonic() < end:
+                    if select.select([child_fd], [], [], 0.05)[0]:
+                        output += os.read(child_fd, 65536)
+                assert b"select model" not in output and b"provider/model-042" in output
+            finally:
+                os.kill(child, signal.SIGTERM)
+                os.waitpid(child, 0)
+                os.close(child_fd)
+            print("preferences: first selection, cancellation, switches, restart, CLI/resume precedence and config preservation: ok")
         finally:
             os.kill(pid, signal.SIGTERM)
             os.waitpid(pid, 0)

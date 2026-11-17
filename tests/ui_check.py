@@ -14,7 +14,7 @@ two classes of bug live here, both of which shipped once:
   markdown tables and the /model picker are laid out against the frame
   width, so they are checked on a real screen rather than in isolation.
 """
-import fcntl, os, pty, select, struct, subprocess, sys, termios, time
+import fcntl, os, pty, select, struct, subprocess, sys, tempfile, termios, time
 
 try:
     import pyte
@@ -26,6 +26,8 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 HARNESS = os.path.join(ROOT, "build", "tests", "term_harness")
 LAMBDA = os.path.join(ROOT, "lambda")
 failures = 0
+config_dir = tempfile.TemporaryDirectory(prefix="lambda-ui-config-")
+os.environ["XDG_CONFIG_HOME"] = config_dir.name
 
 
 def fail(msg):
@@ -73,7 +75,7 @@ def stale_frames():
         os.environ["TERM"] = "xterm-256color"
         os.environ["LAMBDA_SELFTEST_FILL"] = "150"
         os.environ.pop("ANTHROPIC_API_KEY", None)
-        os.execv(LAMBDA, ["lambda", "--anthropic", "--no-log", "--no-context"])
+        os.execv(LAMBDA, ["lambda", "--anthropic", "-m", "claude-fable-5", "--no-log", "--no-context"])
     fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", ROWS, COLS, 0, 0))
     screen = pyte.Screen(COLS, ROWS)
     stream = pyte.ByteStream(screen)
@@ -132,14 +134,15 @@ def stale_frames():
 class Term:
     """lambda on a pty, with an independent emulator watching the output."""
 
-    def __init__(self, rows, cols, env=None):
+    def __init__(self, rows, cols, env=None, model_args=None):
         self.rows, self.cols = rows, cols
         self.pid, self.fd = pty.fork()
         if self.pid == 0:
             os.environ["TERM"] = "xterm-256color"
             os.environ.pop("ANTHROPIC_API_KEY", None)
             os.environ.update(env or {})
-            os.execv(LAMBDA, ["lambda", "--anthropic", "--no-log", "--no-context"])
+            args = ["-m", "claude-fable-5"] if model_args is None else model_args
+            os.execv(LAMBDA, ["lambda", "--anthropic", "--no-log", "--no-context", *args])
         fcntl.ioctl(self.fd, termios.TIOCSWINSZ,
                     struct.pack("HHHH", rows, cols, 0, 0))
         self.screen = pyte.Screen(cols, rows)
@@ -217,6 +220,30 @@ def fenced_table():
         print("  left verbatim")
 
 
+def remembered_direct_model():
+    print("direct model: first launch and remembered default")
+    with tempfile.TemporaryDirectory(prefix="lambda-direct-model-") as directory:
+        env = {"XDG_CONFIG_HOME": directory}
+        t = Term(24, 80, env=env, model_args=[])
+        try:
+            t.pump(0.8)
+            if "select model" not in "\n".join(t.rows_text()):
+                fail("first direct launch did not ask for a model")
+            t.send(b"\r", 0.5)  # confirming the already-highlighted default saves it too
+            with open(os.path.join(directory, "lambda", "default-model-anthropic")) as f:
+                if f.read() != "claude-fable-5\n":
+                    fail("confirming the current model did not save it")
+        finally:
+            t.close()
+        t = Term(24, 80, env=env, model_args=[])
+        try:
+            t.pump(0.8)
+            if "select model" in "\n".join(t.rows_text()):
+                fail("direct launch asked again despite a saved default")
+        finally:
+            t.close()
+
+
 def model_picker():
     """/model opens a list, and choosing from it retitles the frame."""
     print("model picker")
@@ -273,6 +300,7 @@ markdown_tables()
 markdown_links()
 fenced_table()
 model_picker()
+remembered_direct_model()
 print()
 if failures:
     print(f"ui_check: {failures} failure(s)")

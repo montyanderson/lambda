@@ -47,7 +47,7 @@ lambda resume FILE          # continue a specific one
 
 | flag | |
 |---|---|
-| `-m MODEL` | model id (default `claude-fable-5`) |
+| `-m MODEL` | model for this run; otherwise use the saved choice or first-run picker |
 | `--litellm URL` | use a LiteLLM proxy; accepts http/https and an optional `/v1` suffix |
 | `--anthropic` | use Anthropic directly, ignoring saved LiteLLM config |
 | `--models` | print available model ids and exit |
@@ -193,7 +193,7 @@ environment variables override the saved settings:
 export LITELLM_BASE_URL=http://localhost:4000
 export LITELLM_API_KEY=sk-your-lambda-virtual-key
 
-lambda                        # fetch models and open the picker
+lambda                        # pick a model once, then reuse the saved choice
 lambda --models               # print the catalog
 lambda -m local/qwen3.8-27b -p "hello"
 lambda --anthropic            # use the direct Anthropic connection
@@ -210,9 +210,21 @@ list. the fixed catalog holds up to 1024 models; larger lists fail explicitly.
 the proxy may list image, embedding, or retired models: choose a model that
 supports chat (and tool calling when using tools).
 
-an explicit `-m` or resumed model skips the startup picker. lambda fetches
-metadata to size its initial storage; unavailable metadata uses conservative
-defaults. one-shot mode requires `-m` when the proxy offers more than one model.
+on the first interactive launch, lambda asks you to select a model. confirming
+a choice saves it as the default for future launches. `/model` and `/model ID`
+update that default; cancelling the picker leaves it unchanged.
+
+the choice is stored in `~/.config/lambda/default-model` (or under
+`$XDG_CONFIG_HOME/lambda`). direct Anthropic uses `default-model-anthropic`
+in the same directory. these private files contain only a model id; credentials
+and other config are left untouched. delete the relevant file to ask again.
+if saving fails, lambda reports it and keeps the selection for the current chat.
+
+an explicit `-m`, resumed model or saved default skips the startup picker, in
+that order of precedence. `-m` and resume do not overwrite the saved default.
+lambda fetches metadata to size its initial storage; unavailable metadata uses conservative
+defaults. without a saved default, one-shot mode requires `-m` when the proxy
+offers more than one model.
 model selection is recorded in the transcript and restored on resume.
 
 chat uses LiteLLM's [unified messages endpoint](https://docs.litellm.ai/docs/anthropic_unified/),
@@ -276,7 +288,7 @@ to the model once its context has been compacted.
 
 ## model
 
-default is claude fable 5, with `display: "summarized"` so reasoning streams
+the direct Anthropic fallback is claude fable 5, with `display: "summarized"` so reasoning streams
 live in dim italic under a `✻` gutter. `--no-thinking` hides it.
 
 `-e` sets `output_config.effort`. unset means the api default; `xhigh` for

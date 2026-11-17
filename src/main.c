@@ -6,6 +6,7 @@
 #include "gateway.h"
 #include "herdr.h"
 #include "project.h"
+#include "preferences.h"
 #include "session.h"
 #include "ui.h"
 #include "util.h"
@@ -37,7 +38,7 @@ static void usage(void)
            "       lambda -p \"prompt\"      one-shot, print reply to stdout\n"
            "       echo \"prompt\" | lambda  one-shot from stdin\n\n"
            "options:\n"
-           "  -m MODEL       model id (default: %s)\n"
+           "  -m MODEL       model for this run (otherwise saved choice or picker)\n"
            "  --litellm URL  use a LiteLLM proxy (http or https)\n"
            "  --anthropic    use Anthropic directly, ignoring saved LiteLLM config\n"
            "  --models       fetch and print available model ids, then exit\n"
@@ -71,7 +72,7 @@ static void usage(void)
            "  {\"base_url\":\"http://localhost:4000\",\"api_key\":\"sk-...\"}\n\n"
            "transcripts are written to ./.lambda/chats/ as newline-delimited\n"
            "json, one record per line, and can be resumed with -c or -r.\n",
-           LAMBDA_VERSION, LAMBDA_DEFAULT_MODEL);
+           LAMBDA_VERSION);
 }
 
 static const char *HELP_TEXT =
@@ -173,6 +174,17 @@ static int set_model(chat *c, const char *id)
     return 0;
 }
 
+static int select_model(chat *c, const char *id)
+{
+    if (set_model(c, id) != 0) return -1;
+    if (preferences_model_save(gateway_enabled(), id) != 0) {
+        char msg[256];
+        snprintf(msg, sizeof msg, "model selected for this chat, but could not save default: %s", strerror(errno));
+        ui_add(UI_ERROR, msg);
+    }
+    return 0;
+}
+
 static int refresh_models(chat *c)
 {
     if (!gateway_enabled())
@@ -217,9 +229,7 @@ static int choose_model(chat *c)
     int sel = ui_pick("select model", ids, notes, n, cur);
     if (sel < 0)
         return 0;
-    if (sel != cur)
-        set_model(c, ids[sel]);
-    return 1;
+    return select_model(c, ids[sel]) == 0;
 }
 
 static int slash_command(chat *c, const char *line)
@@ -312,7 +322,7 @@ static int slash_command(chat *c, const char *line)
         while (*arg == ' ')
             arg++;
         if (*arg) {
-            if (set_model(c, arg) != 0)
+            if (select_model(c, arg) != 0)
                 return 0;
         } else {
             refresh_models(c);
@@ -474,6 +484,11 @@ int main(int argc, char **argv)
         return 0;
     }
 
+    char saved_model[LAMBDA_MODEL_ID_MAX];
+    int saved = preferences_model_load(gateway_enabled(), saved_model, sizeof saved_model);
+    int preference_error = saved < 0 ? errno : 0;
+    if (saved == 1 && !cli_model) chat_set_model(c, saved_model);
+
     if (cli_voice && voice_enable(1, err, sizeof err) != 0) {
         fprintf(stderr, "lambda: %s\n", err);
         return 2;
@@ -481,6 +496,10 @@ int main(int argc, char **argv)
     atexit(voice_stop);
     ui_set_output_hooks(voice_text, speech_tick, voice_stop);
     ui_init(chat_model(c));
+    if (preference_error) {
+        snprintf(err, sizeof err, "could not read saved model: %s; select a model again", strerror(preference_error));
+        ui_add(UI_NOTICE, err);
+    }
 
     /* project context first: it heads the context window */
     if (!no_context && project_load() > 0) {
@@ -558,9 +577,10 @@ int main(int argc, char **argv)
     session_flush();
     herdr_init(argc, argv);
 
-    /* With an explicit/resumed model, defer discovery until /model so an
+    /* With an explicit/resumed/saved model, defer discovery until /model so an
      * unavailable catalog endpoint never prevents a known model from running. */
-    if (gateway_enabled() && !cli_model && !restored) {
+    if (!cli_model && !restored && saved != 1 &&
+        (gateway_enabled() || (ui_is_tty() && !oneshot))) {
         if (refresh_models(c) != 0 || !chat_model_count()) {
             if (!ui_is_tty() || oneshot) {
                 session_close();
@@ -577,7 +597,6 @@ int main(int argc, char **argv)
             }
             set_model(c, chat_model_at(0)->id);
         } else {
-            set_model(c, chat_model_at(0)->id);
             choose_model(c);
         }
     }
