@@ -6,7 +6,7 @@ extremely fast portable agent harness in c.
 
 * fixed-frame tui, scrolls internally, markdown incl. tables
 * portable and statically linked
-* minimal dynamic memory allocation
+* full conversation history in memory, with model-sized initial storage
 * single-file c plugins (exa web search included)
 * every chat saved as resumable ndjson
 * optional streaming voice output through Inworld TTS
@@ -24,6 +24,7 @@ make uitest     # terminal render + scroll checks (needs python + pyte)
 make apitest    # LiteLLM protocol + picker checks (python stdlib, local socket)
 make contexttest # automatic summaries, context recovery, resume (python stdlib)
 make herdrtest   # herdr lifecycle + resume checks (python stdlib, local sockets)
+make historytest # full transcript retention, large replies, allocation failure
 make STATIC=1   # static binary (best with musl-gcc)
 make DEBUG=1    # asan/ubsan
 ```
@@ -209,9 +210,10 @@ list. the fixed catalog holds up to 1024 models; larger lists fail explicitly.
 the proxy may list image, embedding, or retired models: choose a model that
 supports chat (and tool calling when using tools).
 
-an explicit `-m` or resumed model skips startup discovery. one-shot mode
-requires `-m` when the proxy offers more than one model. model selection is
-recorded in the transcript and restored on resume.
+an explicit `-m` or resumed model skips the startup picker. lambda fetches
+metadata to size its initial storage; unavailable metadata uses conservative
+defaults. one-shot mode requires `-m` when the proxy offers more than one model.
+model selection is recorded in the transcript and restored on resume.
 
 chat uses LiteLLM's [unified messages endpoint](https://docs.litellm.ai/docs/anthropic_unified/),
 which translates streaming replies and tool calls across providers. switching
@@ -224,8 +226,16 @@ proxy's 4096-token default output limit.
 
 ## automatic conversation memory
 
-long chats compact automatically, including during tool loops. lambda checks
-before each request and summarises older work at the earlier of:
+lambda keeps every committed message in memory, including original text,
+reasoning and captured tool results. scrollback also grows without evicting
+old items. a model switch keeps the complete history, including when switching
+to a smaller model. `--no-log` still retains the conversation in memory for
+the lifetime of the process.
+
+the model's context window limits what can be sent in one request. lambda
+maintains a separate active selection of messages for that request. long chats
+summarise older work in this selection, including during tool loops, at the
+earlier of:
 
 * 80% of the model's context window;
 * the context window minus the reply allowance and a tool/safety reserve of
@@ -249,15 +259,20 @@ paired. oversized histories are summarised in chunks, so switching to a smaller
 model works too. summaries run without tools and only show a brief status while
 the normal reply waits.
 
-the complete original transcript stays on disk. a single `compact` record
-commits the new memory and surviving messages; resume restores that state.
+compaction never removes the original messages from memory or scrollback.
+the complete transcript also stays on disk. a single `compact` record commits
+the summary and active selection; resume restores that selection and reloads
+all original messages into memory and scrollback, including compacted messages.
 failed, interrupted or incomplete summaries leave the original history intact.
 if a summary temporarily fails while there is still headroom, the normal request
-continues. the fixed history buffers compact before filling as well.
+continues. message count and allocated buffer capacity do not trigger compaction.
 
-`/context` shows estimated usage and the current threshold. `/compact` updates
-memory immediately. `/clear` removes both messages and memory from the active
-conversation. no manual context management is needed for normal long chats.
+`/context` shows estimated token usage, the threshold, total retained message
+count, stored/reserved history bytes and active message count. `/compact`
+updates the model's working summary while retaining the originals. `/clear`
+explicitly resets the conversation archive and summary; failed turns roll back
+only uncommitted messages. older messages retained in memory are not all sent
+to the model once its context has been compacted.
 
 ## model
 
@@ -390,20 +405,32 @@ into `out`. optional: `available()` hides the tool when e.g. a key is missing,
 tool isn't offered. returns highlights by default (cheap in tokens);
 `full_text` for whole pages. `num_results` 1–25, plus `type` and `category`.
 
-## no malloc
+## memory allocation
 
-every buffer is a static arena sized in `src/config.h`. buffers report
-truncation instead of growing; on overflow the turn rolls back and says so.
-jsmn, picohttpparser and bearssl are allocation-free too.
+history, request/reply buffers, scrollback and their indexes use growable
+storage. selecting a model reserves an initial history and request capacity
+of eight bytes per context token plus 64 kib. reply buffers use the same
+estimate based on the effective output-token limit. capacities round up
+geometrically, and existing allocations never shrink on a model switch.
 
-measured, not assumed: under an `LD_PRELOAD` interposer, a full session
-attributes zero allocations to lambda. the ~500 the process makes are glibc's,
-from `getaddrinfo` and stdio. `objdump -R` shows no allocator import.
+token counts cannot specify a maximum byte size or total conversation length.
+these are initial reservations, not limits: buffers grow as needed, and there
+is no 512-message, 8 mib history or 4 mib scrollback cap. allocations happen
+when reserving or growing capacity, rather than allocating one object per token.
+memory use grows with retained conversation size and is ultimately limited
+by available memory. allocation failures report an error and preserve existing
+history; result storage is reserved before running tools.
 
-bss is ~72.3 mib of arenas in the measured build below. these are demand-paged;
-reserved address space does not all become resident memory at startup.
+protocol frames, individual tool captures, summaries and rendering scratch
+space still have bounded buffers in `src/config.h`. libc can also allocate
+internally for file handling and dns. lambda no longer claims zero explicit
+heap allocations.
 
 ## memory comparison
+
+historical measurement of the earlier fixed-buffer implementation, before
+full history retention and growable storage. these numbers do not describe
+memory growth in the current implementation.
 
 measured on travis, linux x86-64, 2026-11-17: lambda 0.7.0 (the normal `make`
 build, dynamically linked) and codex-cli 0.169.0. one fresh terminal session
@@ -485,9 +512,9 @@ arrays it reallocs. raw mode + diffed grid + key decoding is ~450 lines.
 
 ## tests
 
-`make test` builds `tests/` under asan and ubsan with a deliberately tiny
-transcript arena, so compaction and eviction are exercised in a short run
-rather than only after hours of use.
+`make test` builds `tests/` under asan and ubsan with small initial indexes and
+table scratch storage. it checks growth without eviction, preservation across
+compaction, model switches, rollback, and integer overflow in allocation sizes.
 it also checks JSON/Unicode encoding, search excerpt boundaries, every split
 point in HTTP and SSE fixtures, randomized stream chunks, and queue invariants.
 
@@ -537,6 +564,11 @@ loops, pinned user requests, history capacity and failed-summary rollback.
 reports, changing settings, executable transcript restore, model selection,
 errors, interrupted queues, and missing or unresponsive herdr servers.
 it needs no herdr installation, provider credentials, or external network.
+
+`make historytest` restores 5,000 original messages behind a compacted context,
+round-trips a 1.2 mb streamed reply through disk and the next request, and
+checks that an allocation failure leaves the existing transcript unchanged.
+it uses a local provider fixture and no credentials.
 
 ## limits
 

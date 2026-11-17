@@ -1,5 +1,5 @@
 /* Anthropic Messages API over the raw wire: request building, SSE stream
- * parsing (jsmn), and the tool-use loop. All state is static — no malloc.
+ * parsing (jsmn), and the tool-use loop.
  *
  * History is stored as fully-formed JSON message objects so that text,
  * thinking, tool_use and tool_result blocks all round-trip verbatim. */
@@ -20,6 +20,12 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <stdint.h>
+
+typedef struct {
+    size_t off, len;
+    char model[LAMBDA_MODEL_ID_MAX]; /* producer, for thinking replay */
+} message;
 
 #define API_HOST "api.anthropic.com"
 #define API_VERSION "2023-06-01"
@@ -39,13 +45,12 @@ struct chat {
     int show_thinking;
     char effort[16];
 
-    /* history: raw JSON message objects in an arena */
-    char arena[LAMBDA_HISTORY_ARENA];
-    size_t used;
-    struct {
-        size_t off, len;
-        char model[LAMBDA_MODEL_ID_MAX]; /* producer, for thinking replay */
-    } msgs[LAMBDA_MAX_MSGS];
+    /* The archive owns every original message. Active request descriptors
+     * reference it; compaction never rewrites or frees the original bytes. */
+    char *arena;
+    size_t used, arena_cap;
+    message *history, *msgs;
+    size_t nhistory, history_cap, msgs_cap;
     int nmsgs;
 };
 
@@ -58,6 +63,7 @@ chat *chat_get(void)
 
 void chat_init(chat *c)
 {
+    chat_destroy(c);
     c->used = 0;
     c->nmsgs = 0;
     c->system[0] = '\0';
@@ -73,10 +79,19 @@ void chat_init(chat *c)
     snprintf(c->model, sizeof c->model, "%s", LAMBDA_DEFAULT_MODEL);
 }
 
+void chat_destroy(chat *c)
+{
+    free(c->arena);
+    free(c->history);
+    free(c->msgs);
+    memset(c, 0, sizeof *c);
+}
+
 void chat_clear(chat *c)
 {
     c->used = 0;
     c->nmsgs = 0;
+    c->nhistory = 0;
     c->summary[0] = '\0';
     c->observed_tokens = c->observed_estimate = 0;
 }
@@ -120,6 +135,16 @@ void chat_set_prelude(chat *c, const char *t)
     c->prelude = (t && *t) ? t : NULL;
 }
 int chat_msg_count(const chat *c) { return c->nmsgs; }
+size_t chat_history_count(const chat *c) { return c->nhistory; }
+size_t chat_history_bytes(const chat *c) { return c->used; }
+size_t chat_history_capacity(const chat *c) { return c->arena_cap; }
+
+const char *chat_history_msg(const chat *c, size_t i, size_t *len)
+{
+    if (i >= c->nhistory) return NULL;
+    *len = c->history[i].len;
+    return c->arena + c->history[i].off;
+}
 
 const char *chat_msg(const chat *c, int i, size_t *len)
 {
@@ -132,16 +157,57 @@ void chat_set_tools(chat *c, int on) { c->tools = on; }
 int chat_tools_enabled(const chat *c) { return c->tools; }
 
 /* append a raw JSON message object to history; 0 on success */
+static int reserve_history(chat *c, size_t bytes, size_t active, size_t total)
+{
+    void *p = c->arena;
+    if (storage_reserve(&p, &c->arena_cap, bytes, 1) != 0) return -1;
+    c->arena = p;
+    p = c->msgs;
+    if (active > INT_MAX || storage_reserve(&p, &c->msgs_cap, active, sizeof *c->msgs) != 0) return -1;
+    c->msgs = p;
+    p = c->history;
+    if (storage_reserve(&p, &c->history_cap, total, sizeof *c->history) != 0) return -1;
+    c->history = p;
+    return 0;
+}
+
 static int hist_push(chat *c, const char *json, size_t len)
 {
-    if (c->nmsgs >= LAMBDA_MAX_MSGS || c->used + len > sizeof c->arena)
+    if (len > SIZE_MAX - c->used || c->nhistory == SIZE_MAX ||
+        reserve_history(c, c->used + len, (size_t)c->nmsgs + 1, c->nhistory + 1) != 0)
         return -1;
     memcpy(c->arena + c->used, json, len);
     c->msgs[c->nmsgs].off = c->used;
     c->msgs[c->nmsgs].len = len;
     memcpy(c->msgs[c->nmsgs].model, c->model, sizeof c->model);
+    c->history[c->nhistory++] = c->msgs[c->nmsgs];
     c->nmsgs++;
     c->used += len;
+    return 0;
+}
+
+static void rollback(chat *c, int nmsgs, size_t used)
+{
+    c->nmsgs = nmsgs;
+    c->used = used;
+    while (c->nhistory && c->history[c->nhistory - 1].off >= used) c->nhistory--;
+}
+
+void chat_drop(chat *c, int n)
+{
+    if (n <= 0 || n > c->nmsgs) return;
+    rollback(c, c->nmsgs - n, c->msgs[c->nmsgs - n].off);
+}
+
+int chat_restore_compact(chat *c, int drop, int pin, const char *summary)
+{
+    if (drop < 0 || drop > c->nmsgs || pin < -1 || pin >= drop ||
+        chat_set_summary(c, summary) != 0) return -1;
+    int kept = pin >= 0 ? 1 : 0;
+    if (kept) c->msgs[0] = c->msgs[pin];
+    if (c->nmsgs > drop)
+        memmove(c->msgs + kept, c->msgs + drop, (size_t)(c->nmsgs - drop) * sizeof *c->msgs);
+    c->nmsgs = c->nmsgs - drop + kept;
     return 0;
 }
 
@@ -149,9 +215,8 @@ int chat_push_raw(chat *c, const char *json, size_t len)
 {
     /* Older logs may contain truncated UTF-8 from tool excerpts. Repair the
      * in-memory copy on resume; leave the original transcript untouched. */
-    static char store[LAMBDA_MSG_MAX];
-    buf clean;
-    buf_attach(&clean, store, sizeof store);
+    static buf clean = {.grow = 1};
+    buf_reset(&clean);
     if (j_copy_json(&clean, json, len) != 0)
         return -1;
     return hist_push(c, clean.data, clean.len);
@@ -306,7 +371,7 @@ typedef struct {
     buf errbody;
 
     /* assistant message being reconstructed, as a JSON content array */
-    buf content;   /* "[{...},{...}" — closing bracket added at the end */
+    buf *content;  /* "[{...},{...}" — closing bracket added at the end */
     int nblocks;
     int has_reply; /* text or a tool call, not an unfinished reasoning-only turn */
 
@@ -335,7 +400,7 @@ typedef struct {
 static char s_pending[LAMBDA_SSE_PENDING_MAX];
 static char s_data[LAMBDA_SSE_DATA_MAX];
 static char s_errbody[LAMBDA_ERRBODY_MAX];
-static char s_content[LAMBDA_THINKING_MAX + LAMBDA_REPLY_MAX];
+static buf s_content = {.grow = 1};
 /* Gateways may keep text, reasoning and several tool calls open together.
  * Each SSE index owns its buffers; completed blocks are serialised by index. */
 #define STREAM_BLOCKS_MAX 32
@@ -344,7 +409,6 @@ static struct stream_block {
     buf text, sig, json;
     char tool_id[64], tool_name[64];
 } s_blocks[STREAM_BLOCKS_MAX];
-static char s_block_text[STREAM_BLOCKS_MAX][LAMBDA_THINKING_MAX];
 static char s_block_sig[STREAM_BLOCKS_MAX][8192];
 static char s_block_json[STREAM_BLOCKS_MAX][LAMBDA_TOOL_INPUT_MAX];
 static char s_scratch[LAMBDA_THINKING_MAX]; /* decoded strings */
@@ -357,8 +421,15 @@ static void turn_init(turn *t)
     buf_attach(&t->pending, s_pending, sizeof s_pending);
     buf_attach(&t->data, s_data, sizeof s_data);
     buf_attach(&t->errbody, s_errbody, sizeof s_errbody);
-    buf_attach(&t->content, s_content, sizeof s_content);
-    memset(s_blocks, 0, sizeof s_blocks);
+    buf_reset(&s_content);
+    t->content = &s_content;
+    for (int i = 0; i < STREAM_BLOCKS_MAX; i++) {
+        buf text = s_blocks[i].text;
+        memset(&s_blocks[i], 0, sizeof s_blocks[i]);
+        s_blocks[i].text = text;
+        s_blocks[i].text.grow = 1;
+        buf_reset(&s_blocks[i].text);
+    }
 }
 
 /* stream text to the ui, switching stream kind (reply vs reasoning) as the
@@ -402,20 +473,20 @@ static void block_end(turn *t, struct stream_block *block)
                 buf_appends(&summary_reply, "\n");
             buf_append(&summary_reply, block->text.data, block->text.len);
         }
-        buf_appends(&t->content, t->nblocks ? ",{\"type\":\"text\",\"text\":"
+        buf_appends(t->content, t->nblocks ? ",{\"type\":\"text\",\"text\":"
                                             : "{\"type\":\"text\",\"text\":");
-        buf_append_json_bytes(&t->content, block->text.data, block->text.len);
-        buf_appends(&t->content, "}");
+        buf_append_json_bytes(t->content, block->text.data, block->text.len);
+        buf_appends(t->content, "}");
         t->nblocks++;
         break;
     case 2: /* thinking — replay verbatim on the next request */
-        buf_appends(&t->content,
+        buf_appends(t->content,
                     t->nblocks ? ",{\"type\":\"thinking\",\"thinking\":"
                                : "{\"type\":\"thinking\",\"thinking\":");
-        buf_append_json_bytes(&t->content, block->text.data, block->text.len);
-        buf_appends(&t->content, ",\"signature\":");
-        buf_append_json_bytes(&t->content, block->sig.data, block->sig.len);
-        buf_appends(&t->content, "}");
+        buf_append_json_bytes(t->content, block->text.data, block->text.len);
+        buf_appends(t->content, ",\"signature\":");
+        buf_append_json_bytes(t->content, block->sig.data, block->sig.len);
+        buf_appends(t->content, "}");
         t->nblocks++;
         break;
     case 3: { /* tool_use */
@@ -441,14 +512,14 @@ static void block_end(turn *t, struct stream_block *block)
             break;
         }
         t->has_reply = 1;
-        buf_appends(&t->content, t->nblocks ? ",{\"type\":\"tool_use\",\"id\":"
+        buf_appends(t->content, t->nblocks ? ",{\"type\":\"tool_use\",\"id\":"
                                             : "{\"type\":\"tool_use\",\"id\":");
-        buf_append_json_str(&t->content, block->tool_id);
-        buf_appends(&t->content, ",\"name\":");
-        buf_append_json_str(&t->content, block->tool_name);
-        buf_appends(&t->content, ",\"input\":");
-        buf_appends(&t->content, tc->args);
-        buf_appends(&t->content, "}");
+        buf_append_json_str(t->content, block->tool_id);
+        buf_appends(t->content, ",\"name\":");
+        buf_append_json_str(t->content, block->tool_name);
+        buf_appends(t->content, ",\"input\":");
+        buf_appends(t->content, tc->args);
+        buf_appends(t->content, "}");
         t->nblocks++;
 
         /* record the call so we can run it once the stream ends */
@@ -527,7 +598,7 @@ static void handle_event(turn *t, char *payload, size_t len)
         }
         if (is_start) {
             block->started = 1;
-            buf_attach(&block->text, s_block_text[index], sizeof s_block_text[index]);
+            buf_reset(&block->text);
             buf_attach(&block->sig, s_block_sig[index], sizeof s_block_sig[index]);
             buf_attach(&block->json, s_block_json[index], sizeof s_block_json[index]);
         }
@@ -728,7 +799,7 @@ static void on_idle(void *ud)
 
 /* ---- request building --------------------------------------------------- */
 
-static char s_body[LAMBDA_BODY_MAX];
+static buf s_body = {.grow = 1};
 static char s_hdrs[LAMBDA_REQ_HDRS_MAX];
 
 static void build_body(chat *c, buf *b, int count_only)
@@ -941,7 +1012,7 @@ static int request_body(chat *c, turn *t, const buf *body, char *err, size_t err
         snprintf(err, errsz, "incomplete messages stream (missing message_stop)");
         return -1;
     }
-    if (t->truncated || t->content.overflow) {
+    if (t->truncated || t->content->overflow) {
         snprintf(err, errsz, "stream exceeded the reply buffer; history preserved");
         return -1;
     }
@@ -950,10 +1021,10 @@ static int request_body(chat *c, turn *t, const buf *body, char *err, size_t err
 
 static int do_request(chat *c, turn *t, char *err, size_t errsz)
 {
-    buf body;
-    buf_attach(&body, s_body, sizeof s_body);
-    build_body(c, &body, 0);
-    return request_body(c, t, &body, err, errsz);
+    buf *body = &s_body;
+    buf_reset(body);
+    build_body(c, body, 0);
+    return request_body(c, t, body, err, errsz);
 }
 
 /* ---- conversation memory ----------------------------------------------- */
@@ -975,18 +1046,19 @@ static void memory_idle(void *ud)
 static long count_input(chat *c)
 {
     char err[512], path_store[2048], count_store[4096];
-    buf body, headers, path, result;
-    buf_attach(&body, s_body, sizeof s_body);
+    buf *body = &s_body;
+    buf headers, path, result;
+    buf_reset(body);
     buf_attach(&headers, s_hdrs, sizeof s_hdrs);
     buf_attach(&path, path_store, sizeof path_store);
     buf_attach(&result, count_store, sizeof count_store);
-    build_body(c, &body, 1);
-    if (body.overflow || build_headers(c, &headers, err, sizeof err) != 0)
+    build_body(c, body, 1);
+    if (body->overflow || build_headers(c, &headers, err, sizeof err) != 0)
         return -1;
     int status = 0;
     http_request req = {
         .host = API_HOST, .port = "443", .path = "/v1/messages/count_tokens",
-        .extra_headers = headers.data, .body = body.data, .body_len = body.len,
+        .extra_headers = headers.data, .body = body->data, .body_len = body->len,
         .status = &status, .on_body = receive_count, .body_ud = &result,
         .on_idle = memory_idle, .watch_input = ui_is_tty(),
     };
@@ -1018,7 +1090,22 @@ static const char *SUMMARY_SYSTEM =
 /* A separate work buffer makes the entire multi-chunk operation transactional. */
 static char s_summary_work[LAMBDA_SUMMARY_MAX];
 
-static int summarise(chat *c, size_t bytes, char *err, size_t errsz)
+/* Read the active selection without assuming it is contiguous in the archive. */
+static size_t active_slice(chat *c, int count, size_t offset, size_t limit, buf *out)
+{
+    buf_reset(out);
+    for (int i = 0; i < count && out->len < limit; i++) {
+        size_t len = c->msgs[i].len;
+        if (offset >= len) { offset -= len; continue; }
+        size_t take = len - offset;
+        if (take > limit - out->len) take = limit - out->len;
+        if (buf_append(out, c->arena + c->msgs[i].off + offset, take) != 0) return 0;
+        offset = 0;
+    }
+    return out->len;
+}
+
+static int summarise(chat *c, int count, char *err, size_t errsz)
 {
     snprintf(s_summary_work, sizeof s_summary_work, "%s", c->summary);
     long window = chat_context_window(c);
@@ -1047,48 +1134,60 @@ static int summarise(chat *c, size_t bytes, char *err, size_t errsz)
         memory_bytes = strlen(c->summary);
         s_summary_work[0] = '\0';
     }
+    size_t bytes = 0;
+    for (int i = 0; i < count; i++) bytes += c->msgs[i].len;
+    if (bytes > SIZE_MAX - memory_bytes) return -1;
     size_t total = memory_bytes + bytes;
     long available = window - 1024 - tokens;
     if (available < 256)
         available = 256;
     size_t chunk_limit = (size_t)available * 2;
-    if (chunk_limit > LAMBDA_BODY_MAX / 4)
-        chunk_limit = LAMBDA_BODY_MAX / 4;
+    if (chunk_limit > LAMBDA_SUMMARY_CHUNK_MAX)
+        chunk_limit = LAMBDA_SUMMARY_CHUNK_MAX;
     size_t offset = 0;
     int retry = 0;
     do {
         long room = window - tokens - estimate_tokens(s_summary_work, strlen(s_summary_work)) - 1024;
         if (room < 128)
             room = 128;
-        const char *source = offset < memory_bytes ? c->summary + offset
-                                                   : c->arena + offset - memory_bytes;
+        const char *source;
         size_t remaining = offset < memory_bytes ? memory_bytes - offset : total - offset;
         size_t take = remaining;
         if (take > chunk_limit)
             take = chunk_limit;
         if (take > (size_t)room * 2)
             take = (size_t)room * 2;
+        static buf fragment = {.grow = 1};
+        if (offset < memory_bytes) source = c->summary + offset;
+        else {
+            active_slice(c, count, offset - memory_bytes, take + 4, &fragment);
+            if (fragment.overflow) {
+                snprintf(err, errsz, "not enough memory to build summary; history preserved");
+                return -1;
+            }
+            source = fragment.data ? fragment.data : "";
+        }
         while (take && take < remaining &&
                ((unsigned char)source[take] & 0xC0) == 0x80)
             take--; /* never split a UTF-8 codepoint */
-        buf body;
-        buf_attach(&body, s_body, sizeof s_body);
-        buf_appends(&body, "{\"model\":");
-        buf_append_json_str(&body, c->model);
-        buf_appendf(&body, ",\"stream\":true,\"max_tokens\":%ld,\"system\":", tokens);
-        buf_append_json_str(&body, SUMMARY_SYSTEM);
-        buf_appends(&body, ",\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":");
-        buf_append_json_str2(&body, "Previous memory:", s_summary_work);
-        buf_appends(&body, "},{\"type\":\"text\",\"text\":");
-        buf_append_json_bytes(&body, source, take);
-        buf_appendf(&body, "},{\"type\":\"text\",\"text\":\"Keep the updated memory under %ld words.\"}]}]}", target / 2);
+        buf *body = &s_body;
+        buf_reset(body);
+        buf_appends(body, "{\"model\":");
+        buf_append_json_str(body, c->model);
+        buf_appendf(body, ",\"stream\":true,\"max_tokens\":%ld,\"system\":", tokens);
+        buf_append_json_str(body, SUMMARY_SYSTEM);
+        buf_appends(body, ",\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":");
+        buf_append_json_str2(body, "Previous memory:", s_summary_work);
+        buf_appends(body, "},{\"type\":\"text\",\"text\":");
+        buf_append_json_bytes(body, source, take);
+        buf_appendf(body, "},{\"type\":\"text\",\"text\":\"Keep the updated memory under %ld words.\"}]}]}", target / 2);
         turn t;
         turn_init(&t);
         t.silent = 1;
         buf_attach(&summary_reply, s_summary_reply, sizeof s_summary_reply);
         ui_status("updating conversation memory…");
         ui_render_force();
-        int rc = request_body(c, &t, &body, err, errsz);
+        int rc = request_body(c, &t, body, err, errsz);
         if (rc == API_CONTEXT_ERROR && chunk_limit > 256 && retry++ < 8) {
             chunk_limit /= 2;
             continue; /* a smaller model/incorrect metadata must not strand the chat */
@@ -1183,10 +1282,7 @@ int chat_compact(chat *c, char *err, size_t errsz)
         cut = 0;
         pin = -1; /* only the existing summary needs to shrink */
     }
-    size_t prefix = cut < c->nmsgs ? c->msgs[cut].off : c->used;
-    if (cut == 0)
-        prefix = 0;
-    int rc = summarise(c, prefix, err, errsz);
+    int rc = summarise(c, cut, err, errsz);
     if (rc != 0)
         return rc;
     /* A provider can disregard the summary length instruction. Never commit
@@ -1201,45 +1297,21 @@ int chat_compact(chat *c, char *err, size_t errsz)
         return -1;
     }
     session_sync(c);
-    size_t dest = 0;
-    int kept = 0;
-    if (pin >= 0) {
-        dest = c->msgs[pin].len;
-        memmove(c->arena, c->arena + c->msgs[pin].off, dest);
-        c->msgs[0] = c->msgs[pin];
-        c->msgs[0].off = 0;
-        kept = 1;
-    }
-    memmove(c->arena + dest, c->arena + prefix, c->used - prefix);
-    for (int i = cut; i < c->nmsgs; i++) {
-        c->msgs[kept] = c->msgs[i];
-        c->msgs[kept].off = c->msgs[i].off - prefix + dest;
-        kept++;
-    }
-    c->used = c->used - prefix + dest;
-    c->nmsgs = kept;
-    chat_set_summary(c, s_summary_work);
+    chat_restore_compact(c, cut, pin, s_summary_work);
     session_compact(c, cut, pin);
     return 1;
-}
-
-static int memory_pressure(const chat *c)
-{
-    return c->nmsgs + 4 >= LAMBDA_MAX_MSGS ||
-           c->used + 2 * LAMBDA_MSG_MAX >= sizeof c->arena;
 }
 
 static int prepare_context(chat *c, char *err, size_t errsz)
 {
     long budget = chat_context_threshold(c);
     long estimate = chat_context_tokens(c);
-    int pressure = memory_pressure(c);
-    if (estimate < budget && !pressure)
+    if (estimate < budget)
         return 0;
     long count = count_input(c);
     if (http_interrupted)
         return HTTP_INTERRUPTED;
-    if (count > 0 && count < budget && !pressure)
+    if (count > 0 && count < budget)
         return 0;
     if (fixed_tokens(c) >= budget) {
         snprintf(err, errsz, "system instructions and tools exceed the model's context; use a larger context window");
@@ -1251,7 +1323,27 @@ static int prepare_context(chat *c, char *err, size_t errsz)
 /* ---- public: one full exchange ----------------------------------------- */
 
 static char s_toolout[LAMBDA_TOOL_OUTPUT_MAX];
-static char s_msg[LAMBDA_MSG_MAX];
+static buf s_msg = {.grow = 1};
+
+int chat_prepare_storage(chat *c)
+{
+    long window = chat_context_window(c), output = output_limit(c);
+    if (window < 0 || output < 0 || (size_t)window > (SIZE_MAX - 65536) / 8 ||
+        (size_t)output > (SIZE_MAX - 65536) / 8) return -1;
+    /* Eight bytes/token is an initial capacity estimate, never a hard limit.
+     * Escaped JSON, tool traffic and arbitrarily many turns can exceed it. */
+    size_t history = (size_t)window * 8 + 65536;
+    size_t response = (size_t)output * 8 + 65536;
+    size_t slots = (size_t)window / 256 + 64;
+    if (slots > 4096) slots = 4096;
+    if (reserve_history(c, history, slots, slots) != 0 ||
+        buf_reserve(&s_body, history) != 0 || buf_reserve(&s_content, response) != 0 ||
+        buf_reserve(&s_msg, response) != 0) return -1;
+    s_blocks[0].text.grow = 1;
+    if (buf_reserve(&s_blocks[0].text, response) != 0) return -1;
+    return ui_reserve(history);
+}
+
 
 /* A process can die after publishing tool_use but before saving results.
  * Close those calls explicitly on resume; never silently rerun side effects. */
@@ -1264,9 +1356,9 @@ static int recover_pending_tools(chat *c)
     jdoc d;
     if (jdoc_parse(&d, last, len) != 0 || !j_is(&d, j_get(&d, 0, "role"), "assistant"))
         return 0;
-    buf m;
-    buf_attach(&m, s_msg, sizeof s_msg);
-    buf_appends(&m, "{\"role\":\"user\",\"content\":[");
+    buf *m = &s_msg;
+    buf_reset(m);
+    buf_appends(m, "{\"role\":\"user\",\"content\":[");
     int content = j_get(&d, 0, "content"), n = 0;
     for (int i = 0; i < j_count(&d, content); i++) {
         int b = j_elem(&d, content, i);
@@ -1277,15 +1369,15 @@ static int recover_pending_tools(chat *c)
         buf_attach(&value, id, sizeof id);
         if (j_str(&d, b, "id", &value) != 0 || value.overflow)
             return -1;
-        buf_appends(&m, n++ ? "," : "");
-        buf_appends(&m, "{\"type\":\"tool_result\",\"tool_use_id\":");
-        buf_append_json_str(&m, id);
-        buf_appends(&m, ",\"is_error\":true,\"content\":\"Previous execution ended before its result was saved. Outcome unknown; inspect state before retrying this tool.\"}");
+        buf_appends(m, n++ ? "," : "");
+        buf_appends(m, "{\"type\":\"tool_result\",\"tool_use_id\":");
+        buf_append_json_str(m, id);
+        buf_appends(m, ",\"is_error\":true,\"content\":\"Previous execution ended before its result was saved. Outcome unknown; inspect state before retrying this tool.\"}");
     }
     if (!n)
         return 0;
-    buf_appends(&m, "]}");
-    if (m.overflow || hist_push(c, m.data, m.len) != 0)
+    buf_appends(m, "]}");
+    if (m->overflow || hist_push(c, m->data, m->len) != 0)
         return -1;
     session_sync(c);
     session_flush();
@@ -1298,15 +1390,14 @@ int chat_send(chat *c, const char *user_text)
     char err[1024] = "";
     http_interrupted = 0;
     ui_render_force();
-    chat_context_window(c); /* lazy metadata lookup, before any request state */
+    if (chat_prepare_storage(c) != 0) {
+        ui_add(UI_ERROR, "not enough memory for the selected model; history preserved");
+        return -1;
+    }
     if (http_interrupted)
         return -1;
     if (recover_pending_tools(c) != 0) {
-        ui_add(UI_ERROR, "cannot recover unfinished tool calls: history is full");
-        return -1;
-    }
-    if (memory_pressure(c) && chat_compact(c, err, sizeof err) < 0) {
-        ui_add(UI_ERROR, err);
+        ui_add(UI_ERROR, "cannot retain recovery for unfinished tool calls; history preserved");
         return -1;
     }
     /* Roll back only uncommitted work. Completed tool side effects and their
@@ -1315,15 +1406,14 @@ int chat_send(chat *c, const char *user_text)
     size_t save_used = c->used;
 
     /* user message */
-    buf m;
-    buf_attach(&m, s_msg, sizeof s_msg);
-    buf_appends(&m, "{\"role\":\"user\",\"content\":");
-    buf_append_json_str(&m, user_text);
-    buf_appends(&m, "}");
-    if (m.overflow || hist_push(c, m.data, m.len) != 0) {
-        ui_add(UI_ERROR, "message too large for history (/clear to reset)");
-        c->nmsgs = save_nmsgs;
-        c->used = save_used;
+    buf *m = &s_msg;
+    buf_reset(m);
+    buf_appends(m, "{\"role\":\"user\",\"content\":");
+    buf_append_json_str(m, user_text);
+    buf_appends(m, "}");
+    if (m->overflow || hist_push(c, m->data, m->len) != 0) {
+        ui_add(UI_ERROR, "not enough memory to retain the message; history preserved");
+        rollback(c, save_nmsgs, save_used);
         return -1;
     }
     session_sync(c);
@@ -1342,7 +1432,7 @@ int chat_send(chat *c, const char *user_text)
              * tool side effects. Roll back subsequent failures to this state. */
             save_nmsgs = c->nmsgs;
             save_used = c->used;
-        } else if (rc < 0 && rc != HTTP_INTERRUPTED && !memory_pressure(c) &&
+        } else if (rc < 0 && rc != HTTP_INTERRUPTED &&
                    chat_context_tokens(c) < chat_context_window(c) - output_limit(c) - 256) {
             /* Early compaction leaves headroom for a transient summariser
              * failure. Continue the user's request and try again next round. */
@@ -1369,15 +1459,13 @@ int chat_send(chat *c, const char *user_text)
         }
         if (rc == HTTP_INTERRUPTED || http_interrupted) {
             ui_add(UI_NOTICE, "interrupted");
-            c->nmsgs = save_nmsgs;
-            c->used = save_used;
+            rollback(c, save_nmsgs, save_used);
             session_sync(c);
             return -1;
         }
         if (rc != 0) {
             ui_add(UI_ERROR, err);
-            c->nmsgs = save_nmsgs;
-            c->used = save_used;
+            rollback(c, save_nmsgs, save_used);
             session_sync(c);
             return -1;
         }
@@ -1392,8 +1480,7 @@ int chat_send(chat *c, const char *user_text)
 
         if (!t.has_reply) {
             ui_add(UI_ERROR, "response ended before an answer or tool call; increase --max-tokens and retry; history preserved");
-            c->nmsgs = save_nmsgs;
-            c->used = save_used;
+            rollback(c, save_nmsgs, save_used);
             session_sync(c);
             return -1;
         }
@@ -1407,15 +1494,14 @@ int chat_send(chat *c, const char *user_text)
         /* store the assistant turn */
         if (t.nblocks == 0)
             break;
-        buf_attach(&m, s_msg, sizeof s_msg);
-        buf_appends(&m, "{\"role\":\"assistant\",\"content\":[");
-        buf_append(&m, t.content.data, t.content.len);
-        buf_appends(&m, "]}");
-        if (t.content.overflow || m.overflow ||
-            hist_push(c, m.data, m.len) != 0) {
-            ui_add(UI_ERROR, "reply too large for history (/clear to reset)");
-            c->nmsgs = save_nmsgs;
-            c->used = save_used;
+        buf_reset(m);
+        buf_appends(m, "{\"role\":\"assistant\",\"content\":[");
+        buf_append(m, t.content->data, t.content->len);
+        buf_appends(m, "]}");
+        if (t.content->overflow || m->overflow ||
+            hist_push(c, m->data, m->len) != 0) {
+            ui_add(UI_ERROR, "not enough memory to retain the reply; history preserved");
+            rollback(c, save_nmsgs, save_used);
             session_sync(c);
             return -1;
         }
@@ -1431,20 +1517,21 @@ int chat_send(chat *c, const char *user_text)
 
         /* Reserve results before any side effect. Per-tool output limits
          * below guarantee the aggregate message fits this reservation. */
-        if (c->nmsgs >= LAMBDA_MAX_MSGS ||
-            c->used + LAMBDA_MSG_MAX > sizeof c->arena) {
+        if (c->used > SIZE_MAX - LAMBDA_MSG_MAX || c->nhistory == SIZE_MAX ||
+            reserve_history(c, c->used + LAMBDA_MSG_MAX,
+                            (size_t)c->nmsgs + 1, c->nhistory + 1) != 0 ||
+            buf_reserve(&s_msg, LAMBDA_MSG_MAX) != 0) {
             ui_add(UI_ERROR, "not enough history space for tool results");
-            c->nmsgs = save_nmsgs;
-            c->used = save_used;
+            rollback(c, save_nmsgs, save_used);
             session_sync(c);
             return -1;
         }
         session_flush(); /* persist tool_use before executing it */
 
         /* run the tool calls, then feed results back as one user message */
-        buf results;
-        buf_attach(&results, s_msg, sizeof s_msg);
-        buf_appends(&results, "{\"role\":\"user\",\"content\":[");
+        buf *results = &s_msg;
+        buf_reset(results);
+        buf_appends(results, "{\"role\":\"user\",\"content\":[");
         for (int i = 0; i < t.ncalls; i++) {
             int is_bash = strcmp(t.calls[i].name, "bash") == 0;
             if (is_bash) {
@@ -1499,22 +1586,21 @@ int chat_send(chat *c, const char *user_text)
                 ui_add(UI_TOOL_OUT, out.data);
 
             if (i)
-                buf_appends(&results, ",");
-            buf_appends(&results, "{\"type\":\"tool_result\",\"tool_use_id\":");
-            buf_append_json_str(&results, t.calls[i].id);
+                buf_appends(results, ",");
+            buf_appends(results, "{\"type\":\"tool_result\",\"tool_use_id\":");
+            buf_append_json_str(results, t.calls[i].id);
             if (status != 0)
-                buf_appends(&results, ",\"is_error\":true");
-            buf_appends(&results, ",\"content\":");
-            buf_append_json_bytes(&results, out.len ? out.data : "(no output)",
+                buf_appends(results, ",\"is_error\":true");
+            buf_appends(results, ",\"content\":");
+            buf_append_json_bytes(results, out.len ? out.data : "(no output)",
                                   out.len ? out.len : strlen("(no output)"));
-            buf_appends(&results, "}");
+            buf_appends(results, "}");
         }
-        buf_appends(&results, "]}");
-        if (results.overflow || hist_push(c, results.data, results.len) != 0) {
+        buf_appends(results, "]}");
+        if (results->overflow || hist_push(c, results->data, results->len) != 0) {
             ui_add(UI_ERROR,
-                   "tool output too large for history (/clear to reset)");
-            c->nmsgs = save_nmsgs;
-            c->used = save_used;
+                   "not enough memory to retain tool results");
+            rollback(c, save_nmsgs, save_used);
             session_sync(c);
             return -1;
         }

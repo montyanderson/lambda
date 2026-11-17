@@ -1,7 +1,6 @@
 /* Fixed-frame terminal UI: a title bar, an internally-scrolling transcript,
- * and a bottom input line — built on termbox2. Falls back to plain streamed
- * stdout when not attached to a tty. No dynamic allocation: transcript text
- * lives in a static arena that compacts oldest-first when full. */
+ * and a bottom input line. Falls back to plain streamed stdout when not
+ * attached to a tty. Transcript text and its indexes grow without eviction. */
 
 #include "ui.h"
 #include "config.h"
@@ -19,6 +18,7 @@
 #include "term.h"
 
 #include <stdint.h>
+#include <limits.h>
 #include <time.h>
 
 /* ---- colors ------------------------------------------------------------ */
@@ -73,9 +73,14 @@ typedef struct {
     size_t off, len; /* into g_arena */
 } item;
 
-static char g_arena[LAMBDA_TRANSCRIPT_ARENA];
+static char *g_arena;
+static size_t g_arena_cap;
 static size_t g_used;
-static item g_items[LAMBDA_MAX_ITEMS];
+static item *g_items;
+static size_t g_items_cap;
+static md_flags *g_mdf;
+static size_t g_mdf_cap;
+static int g_store_failed;
 static int g_nitems;
 static int g_streaming;      /* last item is an open stream */
 static int g_stream_kind = -1;
@@ -103,51 +108,47 @@ int ui_is_tty(void)
     return g_tty;
 }
 
-/* drop oldest items until `need` bytes are free at the arena tail */
-/* Drop the oldest `n` items and reclaim their bytes. Items are stored
- * contiguously from offset 0, so dropping a prefix frees exactly
- * g_items[n].off bytes. */
-static void drop_oldest(int n)
+/* Growth never removes an old item. Invalidate wrapped pointers before any
+ * realloc, including a partial allocation failure. */
+static void storage_error(void)
 {
-    if (n <= 0)
-        return;
-    if (n > g_nitems)
-        n = g_nitems;
-    size_t freed = (n < g_nitems) ? g_items[n].off : g_used;
-    memmove(g_arena, g_arena + freed, g_used - freed);
-    g_used -= freed;
-    for (int i = n; i < g_nitems; i++) {
-        g_items[i - n] = g_items[i];
-        g_items[i - n].off -= freed;
-    }
-    g_nitems -= n;
+    g_store_failed = 1;
+    http_interrupted = 1;
+    snprintf(g_status, sizeof g_status, "not enough memory for scrollback; turn interrupted");
     g_gen++;
 }
 
-/* Free at least `need` bytes by discarding the oldest items. The newest item
- * is never dropped: it may be an open stream currently being appended to. */
-static void arena_make_room(size_t need)
+static int transcript_reserve(size_t bytes)
 {
-    size_t avail = sizeof g_arena - g_used;
-    if (avail >= need)
-        return;
-    size_t deficit = need - avail;
-    int drop = 0;
-    while (drop < g_nitems - 1 && g_items[drop].off < deficit)
-        drop++;
-    drop_oldest(drop);
+    if (bytes <= g_arena_cap && bytes <= g_mdf_cap) return 0;
+    g_gen++;
+    void *p = g_arena;
+    if (storage_reserve(&p, &g_arena_cap, bytes, 1) != 0) goto fail;
+    g_arena = p;
+    p = g_mdf;
+    if (storage_reserve(&p, &g_mdf_cap, bytes, sizeof *g_mdf) != 0) goto fail;
+    g_mdf = p;
+    return 0;
+fail:
+    storage_error();
+    return -1;
 }
 
-/* returns the number of bytes actually stored, which is less than `len` if
- * the arena could not be made to fit them */
+int ui_reserve(size_t bytes)
+{
+    if (!g_tty) return 0;
+    if (bytes < g_used) bytes = g_used;
+    if (transcript_reserve(bytes) != 0) return -1;
+    g_store_failed = 0;
+    return 0;
+}
+
 static size_t arena_append(const char *s, size_t len)
 {
-    if (len > sizeof g_arena)
-        len = sizeof g_arena;
-    if (sizeof g_arena - g_used < len)
-        arena_make_room(len);
-    if (sizeof g_arena - g_used < len)
-        len = sizeof g_arena - g_used;
+    if (len > SIZE_MAX - g_used || transcript_reserve(g_used + len) != 0) {
+        storage_error();
+        return 0;
+    }
     memcpy(g_arena + g_used, s, len);
     g_used += len;
     return len;
@@ -211,8 +212,15 @@ void ui_set_model(const char *model)
 /* ---- items ------------------------------------------------------------- */
 static void item_open(int kind)
 {
-    if (g_nitems == LAMBDA_MAX_ITEMS)
-        drop_oldest(1);
+    void *p = g_items;
+    size_t need = (size_t)g_nitems + 1;
+    if (need < LAMBDA_MAX_ITEMS) need = LAMBDA_MAX_ITEMS;
+    if (g_nitems == INT_MAX || storage_reserve(&p, &g_items_cap, need, sizeof *g_items) != 0) {
+        storage_error();
+        return;
+    }
+    g_items = p;
+    g_store_failed = 0;
     g_items[g_nitems].kind = kind;
     g_items[g_nitems].off = g_used;
     g_items[g_nitems].len = 0;
@@ -222,12 +230,13 @@ static void item_open(int kind)
 
 static void item_extend(const char *s, size_t len)
 {
-    if (g_nitems == 0)
+    if (g_nitems == 0 || g_store_failed) return;
+    if (len > INT_MAX - g_items[g_nitems - 1].len) {
+        storage_error();
         return;
-    /* Use the count arena_append reports. Comparing g_used before and after
-     * is wrong: a compaction moves g_used backwards, and the difference
-     * underflows into a huge length. */
-    g_items[g_nitems - 1].len += arena_append(s, len);
+    }
+    size_t added = arena_append(s, len);
+    g_items[g_nitems - 1].len += added;
     g_gen++;
 }
 
@@ -345,12 +354,12 @@ typedef struct {
     unsigned char fence; /* inside a ``` block */
 } vline;
 
-static vline g_vl[LAMBDA_WRAP_LINES];
+static vline *g_vl;
+static size_t g_vl_cap;
 static int g_nvl;
 static int g_first_pending;
 static int g_sol_pending;
 static int g_fence_cur;
-static md_flags g_mdf[LAMBDA_TRANSCRIPT_ARENA];
 
 static int utf8_len(unsigned char c)
 {
@@ -365,8 +374,14 @@ static int utf8_len(unsigned char c)
 
 static void push_vl(int kind, const char *p, int len)
 {
-    if (g_nvl >= LAMBDA_WRAP_LINES)
+    void *data = g_vl;
+    size_t need = (size_t)g_nvl + 1;
+    if (need < 1024) need = 1024;
+    if (g_nvl == INT_MAX || storage_reserve(&data, &g_vl_cap, need, sizeof *g_vl) != 0) {
+        storage_error();
         return;
+    }
+    g_vl = data;
     g_vl[g_nvl].kind = kind;
     g_vl[g_nvl].p = p;
     g_vl[g_nvl].len = len;

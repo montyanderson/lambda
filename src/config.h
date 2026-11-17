@@ -1,14 +1,10 @@
 #ifndef LAMBDA_CONFIG_H
 #define LAMBDA_CONFIG_H
 
-/* lambda does no dynamic allocation: everything lives in fixed static
- * arenas sized here. BSS is lazily paged in, so unused capacity costs
- * virtual address space only, not resident memory. */
+/* Conversation history, request/reply buffers and scrollback grow. The
+ * remaining protocol, tool and UI scratch buffers have explicit limits. */
 
-#define LAMBDA_MAX_MSGS 512              /* turns kept in history */
-#define LAMBDA_HISTORY_ARENA (8u << 20)  /* history text arena */
-#define LAMBDA_BODY_MAX (16u << 20)      /* request body build buffer */
-#define LAMBDA_REPLY_MAX (1u << 20)      /* one streamed reply */
+#define LAMBDA_SUMMARY_CHUNK_MAX (4u << 20) /* max source bytes per summary request */
 #define LAMBDA_SYSTEM_MAX 8192           /* system prompt */
 #define LAMBDA_MODEL_ID_MAX 512
 #define LAMBDA_MODELS_MAX 1024
@@ -37,13 +33,9 @@
 #define LAMBDA_CONTEXT_FILES 16         /* how many such files to load */
 #define LAMBDA_SESSION_QUEUE (1u << 20) /* buffered session-log bytes */
 
-#ifndef LAMBDA_TRANSCRIPT_ARENA
-#define LAMBDA_TRANSCRIPT_ARENA (4u << 20) /* on-screen transcript text */
-#endif
 #ifndef LAMBDA_MAX_ITEMS
-#define LAMBDA_MAX_ITEMS 4096              /* transcript items */
+#define LAMBDA_MAX_ITEMS 64                /* initial transcript item capacity */
 #endif
-#define LAMBDA_WRAP_LINES 65536            /* wrapped visual lines index */
 #ifndef LAMBDA_TABLE_ARENA
 #define LAMBDA_TABLE_ARENA (256u << 10)    /* formatted markdown tables */
 #endif

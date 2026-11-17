@@ -1,6 +1,6 @@
 /* Transcript-arena invariants.
  *
- * ui.c's arena is static, so the test includes the translation unit directly
+ * ui.c's arena is private, so the test includes the translation unit directly
  * to reach it. Everything here runs without a terminal or the network.
  *
  * This exists because the arena only misbehaves once it is full, which in
@@ -33,18 +33,18 @@ static void fail(const char *what, int step)
 /* every invariant the renderer relies on */
 static void check_invariants(int step)
 {
-    if (g_nitems < 0 || g_nitems > LAMBDA_MAX_ITEMS) {
+    if (g_nitems < 0 || (size_t)g_nitems > g_items_cap) {
         fail("item count out of range", step);
         return;
     }
-    if (g_used > sizeof g_arena)
+    if (g_used > g_arena_cap)
         fail("used exceeds arena", step);
 
     size_t total = 0, expect_off = 0;
     for (int i = 0; i < g_nitems; i++) {
         if (g_items[i].off != expect_off)
             fail("items are not contiguous from 0", step);
-        if (g_items[i].len > sizeof g_arena)
+        if (g_items[i].len > g_arena_cap)
             fail("item length larger than the whole arena", step);
         if (g_items[i].off + g_items[i].len > g_used)
             fail("item runs past the end of used space", step);
@@ -57,8 +57,8 @@ static void check_invariants(int step)
 
 int main(void)
 {
-    printf("arena: %u bytes, %d items max\n",
-           (unsigned)sizeof g_arena, LAMBDA_MAX_ITEMS);
+    printf("arena: %u bytes initially, %d initial items\n",
+           (unsigned)g_arena_cap, LAMBDA_MAX_ITEMS);
 
     /* 1. fill far past capacity with varied sizes */
     static char chunk[8192];
@@ -73,7 +73,7 @@ int main(void)
             break;
     }
 
-    /* 2. streaming: many small appends to one item, across compactions */
+    /* 2. streaming: many small appends to one item, across growth */
     if (!failures) {
         item_open(UI_ASSISTANT);
         for (int step = 0; step < 2000; step++) {
@@ -84,7 +84,7 @@ int main(void)
         }
     }
 
-    /* 3. the newest item's bytes must survive compaction intact */
+    /* 3. the newest item's bytes must survive growth intact */
     if (!failures) {
         const char *marker = "MARKER-CONTENT-MUST-SURVIVE";
         item_open(UI_USER);
@@ -96,7 +96,7 @@ int main(void)
             fail("newest item's content was corrupted", 9000);
     }
 
-    /* 4. a single item larger than the arena must be truncated, not wrap */
+    /* 4. a single item larger than the arena must grow without truncation */
     if (!failures) {
         static char huge[1 << 20];
         memset(huge, 'z', sizeof huge);
@@ -121,13 +121,15 @@ int main(void)
         for (int cols = 8; cols <= 200; cols += 17) {
             g_gen++; /* force a rebuild at this width */
             build_vlines(cols);
+            if (cols == 8 && g_nvl <= 65536)
+                fail("visual index did not grow beyond the old line limit", 9200);
             for (int i = 0; i < g_nvl; i++) {
                 const vline *v = &g_vl[i];
                 int inside_arena = v->p >= g_arena &&
                                    v->p + v->len <= g_arena + g_used;
                 int inside_tbl = v->p >= g_tbl &&
                                  v->p + v->len <= g_tbl + g_tbl_used;
-                if (v->len < 0 || (!inside_arena && !inside_tbl))
+                if (v->len < 0 || (v->len > 0 && !inside_arena && !inside_tbl))
                     fail("wrapped line points outside both arenas", 9200);
                 int styled_source = inside_arena && v->kind == UI_ASSISTANT && v->len > 0;
                 if ((v->flags != NULL) != (inside_tbl || styled_source))
@@ -141,6 +143,13 @@ int main(void)
                 break;
         }
     }
+
+    if (g_nitems != 404 || g_items[0].len != 37 ||
+        memcmp(g_arena + g_items[0].off, "aaaaaaaaaa", 10) != 0)
+        fail("oldest item was lost during growth", 9300);
+    if (g_items[402].len != (1u << 20))
+        fail("large item was truncated", 9301);
+    if (g_nvl <= 0) fail("missing visual lines", 9302);
 
     if (failures) {
         printf("arena_test: %d failure(s)\n", failures);

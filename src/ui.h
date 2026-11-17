@@ -18,6 +18,9 @@ int ui_is_tty(void);
 void ui_init(const char *model); /* enters fullscreen tui if on a tty */
 void ui_shutdown(void);
 void ui_set_model(const char *model);
+/* Reserve model-sized scrollback storage; grows further without eviction.
+ * No-op in headless mode, -1 on allocation failure. */
+int ui_reserve(size_t bytes);
 /* Optional live-output consumer. tick returns 1 while background work needs
  * polling; cancel runs on ctrl-c. Restored/history text never calls text. */
 void ui_set_output_hooks(void (*text)(const char *), int (*tick)(void),

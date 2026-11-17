@@ -28,7 +28,7 @@ int main(void)
         feed_sse(&t, stream, split);
         feed_sse(&t, stream + split, strlen(stream) - split);
         assert(t.complete && !t.error && !t.truncated);
-        assert(!strcmp(t.content.data, expected));
+        assert(!strcmp(t.content->data, expected));
     }
     for (unsigned seed = 1; seed <= 200; seed++) {
         unsigned random = seed;
@@ -40,7 +40,7 @@ int main(void)
             feed_sse(&t, stream + pos, n);
             pos += n;
         }
-        assert(t.complete && !t.error && !strcmp(t.content.data, expected));
+        assert(t.complete && !t.error && !strcmp(t.content->data, expected));
     }
     static char oversized[LAMBDA_SSE_PENDING_MAX + 8];
     memset(oversized, 'x', sizeof oversized);

@@ -68,6 +68,8 @@ jobs:
         run: make reliabilitytest
       - name: Herdr lifecycle, session restore and unavailable-server checks
         run: make herdrtest
+      - name: Full history, large replies and allocation failure
+        run: make historytest
 
   static:
     name: static link (glibc)

@@ -211,7 +211,8 @@ def main():
             reset(window=65536)
             file = seed("message-count", messages(510, 50))
             run(file)
-            assert state["summaries"], "fixed history arenas must compact before filling"
+            assert not state["summaries"], "message count alone must not force compaction"
+            assert len(state["normal"][0]["messages"]) == 511
             reset(window=4096)
             file = seed("small-switch", messages(16, 1000))
             run(file)

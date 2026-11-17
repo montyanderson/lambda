@@ -260,9 +260,8 @@ int j_copy_json(buf *out, const char *js, size_t len)
     jdoc d;
     if (jdoc_parse(&d, js, len) != 0)
         return -1;
-    static char decoded[LAMBDA_MSG_MAX];
-    buf value;
-    buf_attach(&value, decoded, sizeof decoded);
+    static buf value = {.grow = 1};
+    buf_reset(&value);
     size_t pos = 0;
     for (int i = 0; i < d.n; i++) {
         if (d.toks[i].type != JSMN_STRING)

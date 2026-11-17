@@ -58,6 +58,10 @@ OBJ := $(patsubst %.c,build/%.o,$(SRC) $(VENDOR_SRC))
 lambda: $(OBJ)
 	$(CC) $(CFLAGS) -o $@ $(OBJ) $(LDFLAGS)
 
+# Public structs are shared across translation units; rebuild their users
+# when a header changes, even without a preceding make clean.
+$(filter build/src/% build/plugins/%,$(OBJ)): $(wildcard src/*.h)
+
 build/%.o: %.c
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) $(CPPFLAGS) -c -o $@ $<
@@ -88,15 +92,14 @@ uninstall:
 
 # Tests include the translation unit under test so they can reach its static
 # state, so they compile their own dependencies rather than linking build/.
-# The arenas are shrunk right down so compaction and the table-layout
-# fallback are both exercised in a short run.
+# Small initial indexes and table scratch storage exercise growth and
+# table-layout fallback in a short run.
 TEST_SRC   := $(filter-out tests/term_harness.c,$(wildcard tests/*.c))
 TEST_BIN   := $(patsubst tests/%.c,build/tests/%,$(TEST_SRC))
 TEST_CFLAGS := -std=c99 -Wall -Wextra -O1 -g -fsanitize=address,undefined
-TEST_DEFS   := -DLAMBDA_TRANSCRIPT_ARENA=4096 -DLAMBDA_MAX_ITEMS=8 \
-               -DLAMBDA_TABLE_ARENA=4096
+TEST_DEFS   := -DLAMBDA_MAX_ITEMS=8 -DLAMBDA_TABLE_ARENA=4096
 
-build/tests/api_stream_test build/tests/http_parser_test: TEST_CFLAGS += -ffunction-sections -fdata-sections $(GC_LDFLAGS)
+build/tests/api_stream_test build/tests/http_parser_test build/tests/history_test: TEST_CFLAGS += -ffunction-sections -fdata-sections $(GC_LDFLAGS)
 build/tests/http_parser_test: TEST_EXTRA_SRC = vendor/picohttpparser/picohttpparser.c
 
 build/tests/%: tests/%.c $(wildcard src/*.c) $(wildcard src/*.h)
@@ -135,6 +138,9 @@ reliabilitytest: lambda
 herdrtest: lambda
 	$(PYTHON) tests/herdr_check.py
 
+historytest: lambda
+	$(PYTHON) tests/full_history_check.py
+
 # Explicit opt-in: uses the configured gateway and paid Lyber models.
 livetest: lambda
 	$(PYTHON) tests/live_gateway_check.py
@@ -142,4 +148,4 @@ livetest: lambda
 clean:
 	rm -rf build lambda
 
-.PHONY: clean release install uninstall test uitest apitest contexttest sessiontest reliabilitytest herdrtest livetest
+.PHONY: clean release install uninstall test uitest apitest contexttest sessiontest reliabilitytest herdrtest historytest livetest

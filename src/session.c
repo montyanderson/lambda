@@ -1,6 +1,6 @@
 /* Newline-delimited JSON transcripts under ./.lambda/chats/.
  *
- * Writes are deferred: records land in a static queue as the conversation
+ * Writes are deferred: records land in a growable queue as the conversation
  * happens, and session_flush() drains it only where a disk wait is harmless
  * (network idle, between turns, while waiting for keyboard input). The render
  * loop and the request path never touch the file. */
@@ -19,14 +19,15 @@
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
+#include <stdlib.h>
+#include <limits.h>
 
 #define CHATS_DIR ".lambda/chats"
 
 static int g_fd = -1;
 static FILE *g_reader; /* keep the replay fd open: closing it releases POSIX locks */
 static char g_path[LAMBDA_PATH_MAX];
-static char g_qstore[LAMBDA_SESSION_QUEUE];
-static buf g_q;
+static buf g_q = {.grow = 1};
 static int g_logged;   /* history messages already written */
 static int g_warned;
 
@@ -142,7 +143,7 @@ static int open_append(const char *path, int create)
     }
     g_fd = fd;
     snprintf(g_path, sizeof g_path, "%s", path);
-    buf_attach(&g_q, g_qstore, sizeof g_qstore);
+    buf_reset(&g_q);
     return 0;
 }
 
@@ -185,15 +186,16 @@ void session_meta(const char *key, const char *value)
 {
     if (g_fd < 0)
         return;
-    static char rec[8192];
-    buf b;
-    buf_attach(&b, rec, sizeof rec);
-    buf_appends(&b, "{\"t\":\"meta\",\"k\":");
-    buf_append_json_str(&b, key);
-    buf_appends(&b, ",\"v\":");
-    buf_append_json_str(&b, value ? value : "");
-    buf_appends(&b, "}");
-    queue(b.data, b.len);
+    static buf storage = {.grow = 1};
+    buf *b = &storage;
+    buf_reset(b);
+    buf_appends(b, "{\"t\":\"meta\",\"k\":");
+    buf_append_json_str(b, key);
+    buf_appends(b, ",\"v\":");
+    buf_append_json_str(b, value ? value : "");
+    buf_appends(b, "}");
+    if (b->overflow) warn_once("not enough memory to save session settings");
+    else queue(b->data, b->len);
 }
 
 /* ---- syncing history ---------------------------------------------------- */
@@ -263,9 +265,8 @@ void session_close(void)
 static void replay_ui(const char *json, size_t len)
 {
     jdoc d;
-    static char sv_store[LAMBDA_TOOL_OUTPUT_MAX];
-    buf sv;
-    buf_attach(&sv, sv_store, sizeof sv_store);
+    static buf sv = {.grow = 1};
+    buf_reset(&sv);
     if (jdoc_parse(&d, json, len) != 0)
         return;
 
@@ -296,25 +297,11 @@ static void replay_ui(const char *json, size_t len)
     }
 }
 
-static char g_line[LAMBDA_MSG_MAX + 1024];
-static long g_offs[LAMBDA_MAX_MSGS]; /* file offset of each surviving msg */
-static char g_producers[LAMBDA_MAX_MSGS][LAMBDA_MODEL_ID_MAX];
-
-/* strip the trailing newline; returns the remaining length */
-static size_t chomp(char *s)
-{
-    size_t len = strlen(s);
-    while (len > 0 && (s[len - 1] == '\n' || s[len - 1] == '\r'))
-        s[--len] = '\0';
-    return len;
-}
-
 int session_resume(const char *path, chat *c)
 {
-    /* Take ownership before reading, so replay and subsequent appends see
-     * one stable history. Keep this same descriptor locked until close. */
-    if (open_append(path, 0) != 0)
-        return -1;
+    /* Lock before reading. Replay all records chronologically: compact alters
+     * only the active selection, while original messages stay in the archive. */
+    if (open_append(path, 0) != 0) return -1;
     FILE *f = fdopen(g_fd, "r");
     if (!f) {
         int error = errno;
@@ -324,108 +311,72 @@ int session_resume(const char *path, chat *c)
     }
     g_reader = f;
     chat_clear(c);
-
-    /* Pass 1: note where each message lives, honouring `drop` records so
-     * rolled-back exchanges are not resurrected. */
-    int nlive = 0;
-    for (;;) {
-        long off = ftell(f);
-        if (!fgets(g_line, sizeof g_line, f))
-            break;
-        size_t len = chomp(g_line);
-        if (len == 0)
-            continue;
+    char *line = NULL;
+    size_t cap = 0;
+    ssize_t n;
+    int needs_newline = 0, error = ENOMEM;
+    buf value = {.grow = 1};
+    while ((n = getline(&line, &cap, f)) >= 0) {
+        needs_newline = n > 0 && line[n - 1] != '\n';
+        size_t len = (size_t)n;
+        while (len && (line[len - 1] == '\n' || line[len - 1] == '\r')) len--;
+        if (!len) continue;
+        if (len > INT_MAX) { error = EOVERFLOW; goto fail; }
         jdoc d;
-        if (jdoc_parse(&d, g_line, len) != 0)
-            continue;
+        if (jdoc_parse(&d, line, len) != 0) continue;
         int t = j_get(&d, 0, "t");
-
         if (j_is(&d, t, "msg")) {
-            if (nlive < LAMBDA_MAX_MSGS) {
-                snprintf(g_producers[nlive], sizeof g_producers[nlive], "%s", chat_model(c));
-                g_offs[nlive++] = off;
-            }
+            const char *m;
+            size_t mlen;
+            if (j_raw(&d, j_get(&d, 0, "m"), &m, &mlen) != 0) continue;
+            if (chat_push_raw(c, m, mlen) != 0) goto fail;
         } else if (j_is(&d, t, "clear")) {
-            nlive = 0;
-            chat_set_summary(c, "");
+            chat_clear(c);
         } else if (j_is(&d, t, "compact")) {
             long drop = j_long(&d, 0, "drop", -1), pin = j_long(&d, 0, "pin", -1);
-            static char text[LAMBDA_SUMMARY_MAX];
-            buf summary;
-            buf_attach(&summary, text, sizeof text);
-            if (drop < 0 || drop > nlive || pin < -1 || pin >= drop ||
-                j_str(&d, 0, "summary", &summary) != 0 || summary.overflow)
-                continue;
-            int keep = pin >= 0 ? 1 : 0;
-            if (keep) {
-                g_offs[0] = g_offs[pin];
-                memmove(g_producers[0], g_producers[pin], LAMBDA_MODEL_ID_MAX);
-            }
-            memmove(g_offs + keep, g_offs + drop, (size_t)(nlive - drop) * sizeof g_offs[0]);
-            memmove(g_producers + keep, g_producers + drop,
-                    (size_t)(nlive - drop) * sizeof g_producers[0]);
-            nlive = nlive - (int)drop + keep;
-            chat_set_summary(c, summary.data);
+            if (drop < 0 || drop > chat_msg_count(c) || pin < -1 || pin >= drop) continue;
+            if (j_str(&d, 0, "summary", &value) == 0 && !value.overflow)
+                chat_restore_compact(c, (int)drop, (int)pin, value.data);
+            else if (value.overflow) goto fail;
         } else if (j_is(&d, t, "drop")) {
-            long n = j_long(&d, 0, "n", 0);
-            nlive -= (int)n;
-            if (nlive < 0)
-                nlive = 0;
+            long drop = j_long(&d, 0, "n", 0);
+            if (drop > 0 && drop <= chat_msg_count(c)) chat_drop(c, (int)drop);
         } else if (j_is(&d, t, "session") || j_is(&d, t, "meta")) {
-            static char sv_store[LAMBDA_SYSTEM_MAX];
-            buf sv;
-            buf_attach(&sv, sv_store, sizeof sv_store);
             if (j_is(&d, t, "session")) {
-                if (j_str(&d, 0, "model", &sv) == 0 && sv.len)
-                    chat_set_model(c, sv.data);
+                if (j_str(&d, 0, "model", &value) == 0 && value.len)
+                    chat_set_model(c, value.data);
             } else {
                 int k = j_get(&d, 0, "k");
-                if (j_is(&d, k, "model") && j_str(&d, 0, "v", &sv) == 0)
-                    chat_set_model(c, sv.data);
-                else if (j_is(&d, k, "system") && j_str(&d, 0, "v", &sv) == 0)
-                    chat_set_system(c, sv.data);
-                else if (j_is(&d, k, "effort") && j_str(&d, 0, "v", &sv) == 0)
-                    chat_set_effort(c, sv.data);
+                if (j_is(&d, k, "model") && j_str(&d, 0, "v", &value) == 0)
+                    chat_set_model(c, value.data);
+                else if (j_is(&d, k, "system") && j_str(&d, 0, "v", &value) == 0)
+                    chat_set_system(c, value.data);
+                else if (j_is(&d, k, "effort") && j_str(&d, 0, "v", &value) == 0)
+                    chat_set_effort(c, value.data);
             }
+            if (value.overflow) goto fail;
         }
     }
-
-    /* Pass 2: restore the survivors, in order. */
-    char final_model[LAMBDA_MODEL_ID_MAX];
-    snprintf(final_model, sizeof final_model, "%s", chat_model(c));
-    int restored = 0;
-    for (int i = 0; i < nlive; i++) {
-        if (fseek(f, g_offs[i], SEEK_SET) != 0)
-            break;
-        if (!fgets(g_line, sizeof g_line, f))
-            break;
-        size_t len = chomp(g_line);
-        jdoc d;
-        if (jdoc_parse(&d, g_line, len) != 0)
-            continue;
-        const char *m;
-        size_t mlen;
-        if (j_raw(&d, j_get(&d, 0, "m"), &m, &mlen) != 0)
-            continue;
-        chat_set_model(c, g_producers[i]);
-        if (chat_push_raw(c, m, mlen) == 0) {
-            replay_ui(m, mlen);
-            restored++;
-        }
+    if (!feof(f)) { error = errno ? errno : EIO; goto fail; }
+    free(line);
+    buf_free(&value);
+    /* Repaint every surviving original, including messages covered by a
+     * summary. Never replay rolled-back turns or pre-/clear history. */
+    size_t total = chat_history_count(c);
+    for (size_t i = 0; i < total; i++) {
+        size_t len;
+        const char *m = chat_history_msg(c, i, &len);
+        replay_ui(m, len);
     }
-    chat_set_model(c, final_model);
-    /* A kill during an append can leave half a checkpoint at EOF. Separate
-     * it from future records so it cannot swallow the next committed message. */
-    int needs_newline = 0;
-    if (fseek(f, 0, SEEK_END) == 0) {
-        long end = ftell(f);
-        if (end > 0 && fseek(f, end - 1, SEEK_SET) == 0)
-            needs_newline = fgetc(f) != '\n';
-    }
-    if (needs_newline)
-        queue("", 0);
+    if (needs_newline) queue("", 0);
     g_logged = chat_msg_count(c);
-    return restored;
+    return total > INT_MAX ? INT_MAX : (int)total;
+fail:
+    free(line);
+    buf_free(&value);
+    session_disable();
+    errno = error;
+    return -1;
 }
 
 int session_find_last(char *out, size_t cap)

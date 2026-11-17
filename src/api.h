@@ -10,7 +10,11 @@ typedef struct chat chat;
 chat *chat_get(void); /* the single static chat instance */
 
 void chat_init(chat *c);
+void chat_destroy(chat *c);
 void chat_clear(chat *c); /* drop conversation history */
+/* Reserve for the selected model. Estimates bytes from token metadata, then
+ * grows as needed; a token limit is not a byte or conversation-length limit. */
+int chat_prepare_storage(chat *c);
 
 const char *chat_model(const chat *c);
 /* Reject empty or oversized ids instead of silently selecting another model. */
@@ -51,6 +55,15 @@ int chat_msg_count(const chat *c);
 const char *chat_msg(const chat *c, int i, size_t *len);
 /* append a verbatim api message object (used when resuming) */
 int chat_push_raw(chat *c, const char *json, size_t len);
+/* Complete retained history, including messages summarised out of requests. */
+size_t chat_history_count(const chat *c);
+size_t chat_history_bytes(const chat *c);
+size_t chat_history_capacity(const chat *c);
+const char *chat_history_msg(const chat *c, size_t i, size_t *len);
+/* Transcript replay operations; never call the model. Compaction changes only
+ * the active request selection. A drop removes rolled-back tail messages. */
+int chat_restore_compact(chat *c, int drop, int pin, const char *summary);
+void chat_drop(chat *c, int n);
 
 /* extra text placed at the very front of the system prompt (project context) */
 void chat_set_prelude(chat *c, const char *text);

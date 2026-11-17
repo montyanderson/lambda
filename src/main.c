@@ -157,8 +157,15 @@ static void refresh_badge(chat *c)
 
 static int set_model(chat *c, const char *id)
 {
+    char previous[LAMBDA_MODEL_ID_MAX];
+    snprintf(previous, sizeof previous, "%s", chat_model(c));
     if (chat_set_model(c, id) != 0) {
         ui_add(UI_ERROR, "model id is empty or too long");
+        return -1;
+    }
+    if (chat_prepare_storage(c) != 0) {
+        chat_set_model(c, previous);
+        ui_add(UI_ERROR, "not enough memory for that model; previous model and history kept");
         return -1;
     }
     ui_set_model(id);
@@ -233,6 +240,11 @@ static int slash_command(chat *c, const char *line)
         snprintf(msg, sizeof msg, "context: ~%ld / %ld tokens; auto-summary at %ld%s",
                  chat_context_tokens(c), window, chat_context_threshold(c),
                  chat_summary(c)[0] ? " · earlier work summarised" : "");
+        ui_add(UI_NOTICE, msg);
+        snprintf(msg, sizeof msg,
+                 "history: %zu messages, %.2f mib stored, %.2f mib reserved; %d messages in active context",
+                 chat_history_count(c), (double)chat_history_bytes(c) / 1048576.0,
+                 (double)chat_history_capacity(c) / 1048576.0, chat_msg_count(c));
         ui_add(UI_NOTICE, msg);
     } else if (strcmp(line, "/compact") == 0) {
         http_interrupted = 0;
@@ -568,6 +580,13 @@ int main(int argc, char **argv)
             set_model(c, chat_model_at(0)->id);
             choose_model(c);
         }
+    }
+
+    if (chat_prepare_storage(c) != 0) {
+        ui_add(UI_ERROR, "not enough memory for the selected model");
+        session_close();
+        ui_shutdown();
+        return 1;
     }
 
     if (oneshot) {

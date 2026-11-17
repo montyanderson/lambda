@@ -3,6 +3,29 @@
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <errno.h>
+
+int storage_reserve(void **data, size_t *capacity, size_t need, size_t element)
+{
+    if (!element || need > (size_t)PTRDIFF_MAX / element) {
+        errno = ENOMEM;
+        return -1;
+    }
+    if (need <= *capacity) return 0;
+    size_t cap = *capacity ? *capacity : 16;
+    if (cap > (size_t)PTRDIFF_MAX / element) cap = need;
+    while (cap < need) {
+        if (cap > (size_t)PTRDIFF_MAX / element / 2) { cap = need; break; }
+        cap *= 2;
+    }
+    void *p = realloc(*data, cap * element);
+    if (!p) return -1;
+    *data = p;
+    *capacity = cap;
+    return 0;
+}
 
 void buf_attach(buf *b, char *storage, size_t cap)
 {
@@ -10,6 +33,7 @@ void buf_attach(buf *b, char *storage, size_t cap)
     b->cap = cap;
     b->len = 0;
     b->overflow = 0;
+    b->grow = 0;
     if (cap > 0)
         b->data[0] = '\0';
 }
@@ -22,12 +46,41 @@ void buf_reset(buf *b)
         b->data[0] = '\0';
 }
 
+int buf_reserve(buf *b, size_t capacity)
+{
+    if (capacity <= b->cap) return 0;
+    void *p = b->data;
+    if (!b->grow || storage_reserve(&p, &b->cap, capacity, 1) != 0) {
+        b->overflow = 1;
+        return -1;
+    }
+    b->data = p;
+    b->data[b->len] = '\0';
+    return 0;
+}
+
+void buf_free(buf *b)
+{
+    if (b->grow) free(b->data);
+    memset(b, 0, sizeof *b);
+}
+
 int buf_append(buf *b, const char *data, size_t len)
 {
+    /* Preserve an internal source offset if growth moves this buffer. */
+    uintptr_t source = (uintptr_t)data, base = (uintptr_t)b->data;
+    int internal = b->data && source >= base && source - base < b->cap;
+    size_t offset = internal ? (size_t)(source - base) : 0;
+    if (b->grow && (len >= SIZE_MAX - b->len ||
+        buf_reserve(b, b->len + len + 1) != 0)) {
+        b->overflow = 1;
+        return -1;
+    }
+    if (internal) data = b->data + offset;
     size_t room = b->cap > b->len + 1 ? b->cap - b->len - 1 : 0;
     size_t take = len < room ? len : room;
     if (take)
-        memcpy(b->data + b->len, data, take);
+        memmove(b->data + b->len, data, take);
     b->len += take;
     if (b->cap)
         b->data[b->len] = '\0';
@@ -46,6 +99,16 @@ int buf_appends(buf *b, const char *s)
 int buf_appendf(buf *b, const char *fmt, ...)
 {
     va_list ap;
+    if (b->grow) {
+        va_start(ap, fmt);
+        int needed = vsnprintf(NULL, 0, fmt, ap);
+        va_end(ap);
+        if (needed < 0 || (size_t)needed >= SIZE_MAX - b->len ||
+            buf_reserve(b, b->len + (size_t)needed + 1) != 0) {
+            b->overflow = 1;
+            return -1;
+        }
+    }
     size_t room = b->cap > b->len ? b->cap - b->len : 0;
     va_start(ap, fmt);
     int n = vsnprintf(room ? b->data + b->len : NULL, room, fmt, ap);
@@ -99,6 +162,7 @@ int buf_append_utf8(buf *b, const char *s, size_t len)
  * Tool output is arbitrary bytes, and byte limits can bisect a character. */
 static int json_str_body(buf *b, const char *s, size_t len)
 {
+    if (!len) return 0;
     int rc = 0;
     for (const unsigned char *p = (const unsigned char *)s;
          p < (const unsigned char *)s + len; p++) {
